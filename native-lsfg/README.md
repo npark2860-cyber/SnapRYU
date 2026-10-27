@@ -44,7 +44,7 @@ ctest --test-dir build --output-on-failure
 ## License and origin
 
 GPL-3.0-or-later (`ported/LICENSE.md`).
-The frame-generation code is ported from [lsfg-vk-aarch64](https://github.com/FrankBarretta/lsfg-vk-aarch64), commit `617203ee5c65c3ec858778366f08814197415bd2`, which is based on [lsfg-vk](https://github.com/PancakeTAS/lsfg-vk).
+The frame-generation code is ported from [lsfg-vk-aarch64](https://github.com/FrankBarretta/lsfg-vk-aarch64), commit `617203ee5c65c3ec858778366f08814197415bd2`.
 Details are in `ported/third_party/lsfg_legacy/README.md` and `provenance.json`.
 
 Lossless Scaling is a separate commercial product and is not covered by this license.
