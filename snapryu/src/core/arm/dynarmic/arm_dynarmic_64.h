@@ -1,0 +1,167 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <atomic>
+#include <memory>
+#include <optional>
+#include <ankerl/unordered_dense.h>
+
+#include <dynarmic/interface/A64/a64.h>
+#include <dynarmic/interface/code_page.h>
+#include "common/common_types.h"
+#include "common/hash.h"
+#include "core/arm/arm_interface.h"
+#include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
+
+namespace Core::Memory {
+class Memory;
+}
+
+namespace Kernel {
+enum class DebugWatchpointType : u8;
+class KPRocess;
+}
+
+namespace Core {
+
+class ArmDynarmic64;
+class DynarmicExclusiveMonitor;
+class System;
+
+class DynarmicCallbacks64 : public Dynarmic::A64::UserCallbacks {
+public:
+    explicit DynarmicCallbacks64(ArmDynarmic64& parent, Kernel::KProcess* process);
+
+    void SetPrivateMemoryView(u64 base, u64 size) noexcept;
+    void ClearPrivateMemoryView() noexcept;
+
+    u8 MemoryRead8(u64 vaddr) override;
+    u16 MemoryRead16(u64 vaddr) override;
+    u32 MemoryRead32(u64 vaddr) override;
+    u64 MemoryRead64(u64 vaddr) override;
+    Dynarmic::A64::Vector MemoryRead128(u64 vaddr) override;
+    std::optional<u32> MemoryReadCode(u64 vaddr) override;
+    void InstructionSynchronizationBarrierRaised() override {
+        last_code_addr = u64(-1); //reset back, force refetch
+    }
+    void MemoryWrite8(u64 vaddr, u8 value) override;
+    void MemoryWrite16(u64 vaddr, u16 value) override;
+    void MemoryWrite32(u64 vaddr, u32 value) override;
+    void MemoryWrite64(u64 vaddr, u64 value) override;
+    void MemoryWrite128(u64 vaddr, Dynarmic::A64::Vector value) override;
+    bool MemoryWriteExclusive8(u64 vaddr, std::uint8_t value, std::uint8_t expected) override;
+    bool MemoryWriteExclusive16(u64 vaddr, std::uint16_t value, std::uint16_t expected) override;
+    bool MemoryWriteExclusive32(u64 vaddr, std::uint32_t value, std::uint32_t expected) override;
+    bool MemoryWriteExclusive64(u64 vaddr, std::uint64_t value, std::uint64_t expected) override;
+    bool MemoryWriteExclusive128(u64 vaddr, Dynarmic::A64::Vector value, Dynarmic::A64::Vector expected) override;
+    void InstructionCacheOperationRaised(Dynarmic::A64::InstructionCacheOperation op, u64 value) override;
+    void ExceptionRaised(u64 pc, Dynarmic::A64::Exception exception) override;
+    void CallSVC(u32 svc) override;
+    void AddTicks(u64 ticks) override;
+    u64 GetTicksRemaining() override;
+    u64 GetCNTPCT() override;
+    bool CheckMemoryAccess(u64 addr, u64 size, Kernel::DebugWatchpointType type);
+    bool ReadMemoryWithPrivateView(u64 vaddr, void* output, std::size_t size);
+    bool WriteMemoryWithPrivateView(u64 vaddr, const void* input, std::size_t size);
+    void ReturnException(u64 pc, Dynarmic::HaltReason hr);
+
+    Dynarmic::CodePage cached_code_page;
+    u64 last_code_addr = u64(-1);
+
+    // P3E selective single-step override. Dynarmic single-stepping translates exactly one
+    // instruction, so the fallback backend can return the original guest opcode directly for
+    // that PC instead of copying and mutating an entire 4 KiB code page before every Step().
+    bool m_single_instruction_override_active{};
+    u64 m_single_instruction_override_pc{};
+    u32 m_single_instruction_override_instruction{};
+
+    ArmDynarmic64& m_parent;
+    Core::Memory::Memory& m_memory;
+    u64 m_tpidrro_el0{};
+    u64 m_tpidr_el0{};
+    Kernel::KProcess* m_process{};
+    const bool m_debugger_enabled{};
+    const bool m_check_memory_access{};
+    u64 m_private_memory_base{};
+    u64 m_private_memory_end{};
+    static constexpr u64 MinimumRunCycles = 10000U;
+};
+
+class ArmDynarmic64 final : public ArmInterface {
+public:
+    ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProcess* process,
+                  DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index,
+                  bool force_memory_callbacks = false);
+    ~ArmDynarmic64() override;
+
+    Architecture GetArchitecture() const override {
+        return Architecture::AArch64;
+    }
+
+    HaltReason RunThread(Kernel::KThread* thread) override;
+    HaltReason StepThread(Kernel::KThread* thread) override;
+
+    void GetContext(Kernel::Svc::ThreadContext& ctx) const override;
+    void SetContext(const Kernel::Svc::ThreadContext& ctx) override;
+    void SetTpidrroEl0(u64 value) override;
+
+    void GetSvcArguments(std::span<uint64_t, 8> args) const override;
+    void SetSvcArguments(std::span<const uint64_t, 8> args) override;
+    u32 GetSvcNumber() const override;
+
+    void SignalInterrupt(Kernel::KThread* thread) override;
+    void ClearInstructionCache() override;
+    void InvalidateCacheRange(u64 addr, std::size_t size) override;
+
+    // IMP-006 selective fallback only: override the code word fetched at one guest PC without
+    // changing the process mapping. The private x18 runner may reuse a compiled single-step block
+    // only while the (pc, original instruction) identity remains unchanged.
+    void SetSingleInstructionCodeOverride(u64 pc, u32 instruction);
+    void ClearSingleInstructionCodeOverride();
+
+    void SetPrivateMemoryView(u64 base, u64 size) noexcept;
+    void ClearPrivateMemoryView() noexcept;
+
+    // R2c-A: the Windows NCE fallback runs this backend inside PhysicalCore's execution context,
+    // where callbacks must not wait on guest kernel objects.
+    void SetNceFallbackMode() noexcept {
+        m_nce_fallback = true;
+    }
+
+protected:
+    const Kernel::DebugWatchpoint* HaltedWatchpoint() const override;
+    void RewindBreakpointInstruction() override;
+
+private:
+    System& m_system;
+    DynarmicExclusiveMonitor& m_exclusive_monitor;
+
+private:
+    friend class DynarmicCallbacks64;
+
+    void MakeJit(Common::PageTable* page_table, std::size_t address_space_bits);
+    std::optional<DynarmicCallbacks64> m_cb{};
+    std::size_t m_core_index{};
+    bool m_nce_fallback{};
+
+    std::optional<Dynarmic::A64::Jit> m_jit{};
+
+    // IMP-006 x18 fallback: remember the semantic identity of compiled single-step sites so a
+    // hot site can reuse its JIT block without invalidating it on every trap. A changed original
+    // instruction at the same guest PC still invalidates before the next step.
+    ankerl::unordered_dense::map<u64, u32> m_single_instruction_override_cache{};
+
+    // SVC callback
+    u32 m_svc{};
+
+    // Watchpoint info
+    const Kernel::DebugWatchpoint* m_halted_watchpoint{};
+    Kernel::Svc::ThreadContext m_breakpoint_context{};
+};
+
+} // namespace Core

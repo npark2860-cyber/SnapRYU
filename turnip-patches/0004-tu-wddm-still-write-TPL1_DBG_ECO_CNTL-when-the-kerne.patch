@@ -1,0 +1,70 @@
+From d800cf2b808f58b5b9d2f495aa3827250ff55fe3 Mon Sep 17 00:00:00 2001
+From: SnapRYU <snapryu@users.noreply.invalid>
+Date: Sat, 24 Oct 2026 17:33:47 +0000
+Subject: [PATCH 4/6] tu/wddm: still write TPL1_DBG_ECO_CNTL when the kernel
+ owns magic regs
+
+Without it, compute sampling of UBWC RGBA16F images (lossless scaling frame
+generation) hangs the GPU on Adreno X1-85 about once every 6 test passes;
+with the Qualcomm value it ran 360 passes without a hang. The other magic
+registers stay with the kernel: writing TPL1_DBG_ECO_CNTL1 or 0x8e79 from the
+command stream loses the device.
+---
+ src/freedreno/vulkan/tu_cmd_buffer.cc | 15 +++++++++++++--
+ src/freedreno/vulkan/tu_device.cc     | 10 ++++++----
+ 2 files changed, 19 insertions(+), 6 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 8d95229cf74..bf749676da0 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -2191,12 +2191,23 @@ tu6_init_static_regs(struct tu_device *dev, struct tu_cs *cs)
+       ));
+    }
+ 
+-   for (size_t i = 0; !phys_dev->kernel_sets_magic_regs &&
+-                      i < ARRAY_SIZE(phys_dev->info->magic_raw); i++) {
++   for (size_t i = 0; i < ARRAY_SIZE(phys_dev->info->magic_raw); i++) {
+       auto magic_reg = phys_dev->info->magic_raw[i];
+       if (!magic_reg.reg)
+          break;
+ 
++      /* When the kernel owns the magic registers (WDDM), still write
++       * TPL1_DBG_ECO_CNTL. On Adreno X1-85 with the Windows driver, LSFG frame
++       * generation (compute sampling UBWC RGBA16F images) hangs the GPU about
++       * once every 6 test passes unless this register gets the Qualcomm value;
++       * with it, 360 passes ran without a hang. Leave the rest to the kernel:
++       * writing TPL1_DBG_ECO_CNTL1 or 0x8e79 from the command stream loses the
++       * device there.
++       */
++      if (phys_dev->kernel_sets_magic_regs &&
++          magic_reg.reg != REG_A6XX_TPL1_DBG_ECO_CNTL)
++         continue;
++
+       uint32_t value = magic_reg.value;
+       switch(magic_reg.reg) {
+          case REG_A6XX_TPL1_DBG_ECO_CNTL:
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index c046cc3008c..9b9e8b5b5fe 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -1745,10 +1745,12 @@ tu_physical_device_init(struct tu_physical_device *device,
+       device->dev_info = info;
+       device->info = &device->dev_info;
+ 
+-      /* When the kernel owns the magic registers we never write
+-       * TPL1_DBG_ECO_CNTL. The Qualcomm value (0x11100000 in raw_magic_regs)
+-       * leaves LINEAR_MIPMAP_FALLBACK_IN_BLOCKS clear, so the hardware
+-       * compares the linear mipmap fallback threshold in texels.
++      /* When the kernel owns the magic registers, TPL1_DBG_ECO_CNTL is the
++       * only one Turnip writes (tu6_init_static_regs). It writes the Qualcomm
++       * value (0x11100000 in raw_magic_regs) with
++       * LINEAR_MIPMAP_FALLBACK_IN_BLOCKS taken from this flag, so keeping the
++       * flag false keeps the bit clear and the hardware compares the linear
++       * mipmap fallback threshold in texels.
+        * Lay images out the same way, or compressed mip levels between the
+        * texel and block thresholds are sampled with the wrong tiling.
+        */
+-- 
+2.43.0
+

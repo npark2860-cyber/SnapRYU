@@ -1,0 +1,48 @@
+// SPDX-FileCopyrightText: 2018 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include "winresrc.h"
+/////////////////////////////////////////////////////////////////////////////
+//
+// Icon
+//
+
+// Icon with lowest ID value placed first to ensure application icon
+// remains consistent on all systems.
+// QT requires that the default application icon is named IDI_ICON1
+
+IDI_ICON1               ICON                    "../../dist/snapryu.ico"
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// RT_MANIFEST
+//
+
+0                       RT_MANIFEST             "../../dist/yuzu.manifest"
+
+1 VERSIONINFO
+ FILEVERSION 1,0,110,5
+ PRODUCTVERSION 1,0,110,5
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+BEGIN
+ BLOCK "StringFileInfo"
+ BEGIN
+  BLOCK "040904b0"
+  BEGIN
+   VALUE "CompanyName", "SnapRYU contributors\0"
+   VALUE "FileDescription", "SnapRYU - b110 Windows ARM64 with Go mode\0"
+   VALUE "FileVersion", "1.0.110.5\0"
+   VALUE "InternalName", "SnapRYU-b110\0"
+   VALUE "OriginalFilename", "SnapRYU-b110.exe\0"
+   VALUE "ProductName", "SnapRYU\0"
+   VALUE "ProductVersion", "1.0.110.5\0"
+   VALUE "LegalCopyright", "SnapRYU, Eden and yuzu contributors; see licenses\0"
+  END
+ END
+ BLOCK "VarFileInfo"
+ BEGIN
+  VALUE "Translation", 0x409, 1200
+ END
+END

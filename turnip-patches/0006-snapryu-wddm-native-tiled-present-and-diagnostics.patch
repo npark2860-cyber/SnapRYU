@@ -1,0 +1,2122 @@
+--- a/src/freedreno/vulkan/tu_clear_blit.cc
++++ b/src/freedreno/vulkan/tu_clear_blit.cc
+@@ -3880,6 +3880,9 @@
+    ops->teardown(cmd, cs);
+ }
+ 
++/* SNAPRYU frame stats (diagnostic DLL only), implemented in tu_knl_wddm.cc. */
++void tu_framestat_copy(uint64_t bytes, bool old_compute);
++
+ template <chip CHIP>
+ VKAPI_ATTR void VKAPI_CALL
+ tu_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
+@@ -3891,6 +3894,19 @@
+ 
+    trace_start_copy_buffer(&cmd->trace, &cmd->cs, cmd);
+ 
++   {
++      bool old_compute = true;
++      uint64_t bytes = 0;
++      for (unsigned i = 0; i < pCopyBufferInfo->regionCount; ++i) {
++         const VkBufferCopy2 *region = &pCopyBufferInfo->pRegions[i];
++         old_compute &= ((vk_buffer_address(&src_buffer->vk, region->srcOffset) |
++                          vk_buffer_address(&dst_buffer->vk, region->dstOffset) |
++                          region->size) & 15) == 0;
++         bytes += region->size;
++      }
++      tu_framestat_copy(bytes, old_compute && bytes >= 65536);
++   }
++
+    /* Choose the largest common block size for all copy regions
+     * to prevent WaW hazards when potentially performing non-overlapping
+     * unaligned stores through CCU. See handle_buffer_unaligned_store.
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -4224,6 +4224,30 @@
+    tu_trace_end_render_pass<CHIP>(cmd, false, NULL);
+ }
+ 
++/* SNAPRYU frame stats (diagnostic DLL only), implemented in tu_knl_wddm.cc. */
++void tu_framestat_rp(uint64_t sig, bool sysmem, uint32_t width, uint32_t height);
++
++static uint64_t
++tu_framestat_sig(const struct tu_cmd_buffer *cmd)
++{
++   const struct tu_render_pass *pass = cmd->state.pass;
++   const struct tu_framebuffer *fb = cmd->state.framebuffer;
++   uint64_t h = 0xcbf29ce484222325ull;
++   const auto mix = [&h](uint64_t v) {
++      h ^= v;
++      h *= 0x100000001b3ull;
++   };
++   mix(fb ? fb->width : 0);
++   mix(fb ? fb->height : 0);
++   mix(fb ? fb->layers : 0);
++   mix(pass ? pass->attachment_count : 0);
++   for (uint32_t i = 0; pass && i < pass->attachment_count; i++) {
++      mix(pass->attachments[i].format);
++      mix(pass->attachments[i].samples);
++   }
++   return h ^ (h >> 32);
++}
++
+ template <chip CHIP>
+ void
+ tu_cmd_render(struct tu_cmd_buffer *cmd_buffer,
+@@ -4235,7 +4259,13 @@
+    tu_autotune::rp_key_opt rp_key = cmd_buffer->device->autotune->emit_preempt_latency_tracking_rp_hash(cmd_buffer);
+ 
+    tu_autotune::rp_ctx_t rp_ctx = NULL;
+-   if (use_sysmem_rendering(cmd_buffer, &rp_ctx, rp_key))
++   const bool use_sysmem = use_sysmem_rendering(cmd_buffer, &rp_ctx, rp_key);
++   {
++      const struct tu_framebuffer *fb = cmd_buffer->state.framebuffer;
++      tu_framestat_rp(tu_framestat_sig(cmd_buffer), use_sysmem,
++                      fb ? fb->width : 0, fb ? fb->height : 0);
++   }
++   if (use_sysmem)
+       tu_cmd_render_sysmem<CHIP>(cmd_buffer, rp_ctx);
+    else
+       tu_cmd_render_tiles<CHIP>(cmd_buffer, rp_ctx, fdm_offsets);
+--- a/src/freedreno/vulkan/tu_knl_wddm.cc
++++ b/src/freedreno/vulkan/tu_knl_wddm.cc
+@@ -12,6 +12,112 @@
+ #include "vk_fence.h"
+ #include "vk_sync_dummy.h"
+ #include "wsi_common_private.h"
++#include "util/os_misc.h"
++#include <stdio.h>
++#include <mutex>
++#include <unordered_map>
++
++/* SNAPRYU frame stats (diagnostic DLL only). TU_FRAMESTAT=<file> gets one line per second:
++ * submit count and CPU time, longest gap between submits, retire-list work, and how many
++ * render passes ran in sysmem/gmem and how often a pass signature switched mode.
++ */
++struct tu_framestat {
++   std::mutex lock;
++   FILE *log = nullptr;
++   uint64_t start_ns = 0, window_ns = 0, last_submit_ns = 0;
++   uint64_t submits = 0, submit_ns = 0, submit_max_ns = 0, gap_max_ns = 0;
++   uint64_t waits = 0, signals = 0;
++   uint64_t retire_calls = 0, retire_ns = 0, retire_max_ns = 0, retire_len_max = 0, retire_freed = 0;
++   uint64_t rp_sysmem = 0, rp_gmem = 0, rp_flips = 0;
++   uint64_t big_sysmem = 0, big_gmem = 0, big_flips = 0;
++   uint64_t block_waits = 0, block_wait_ns = 0, block_wait_max_ns = 0;
++   uint64_t copies = 0, copy_bytes = 0, copy_old_compute = 0, copy_old_compute_bytes = 0;
++   std::unordered_map<uint64_t, uint8_t> last_mode;
++};
++
++static tu_framestat *
++tu_framestat_get(void)
++{
++   return nullptr;
++}
++
++static void
++tu_framestat_flush_locked(tu_framestat *s, uint64_t now)
++{
++   if (!s->window_ns) {
++      s->start_ns = s->window_ns = now;
++      return;
++   }
++   if (now - s->window_ns < 1000000000ull)
++      return;
++   fprintf(s->log,
++           "t=%.1f submits=%llu submit_us_avg=%.1f submit_us_max=%.1f gap_ms_max=%.2f waits=%llu signals=%llu "
++           "retire_calls=%llu retire_us_avg=%.2f retire_us_max=%.1f retire_len_max=%llu retire_freed=%llu "
++           "rp_sysmem=%llu rp_gmem=%llu rp_flips=%llu big_sysmem=%llu big_gmem=%llu big_flips=%llu "
++           "block_waits=%llu block_wait_ms_avg=%.2f block_wait_ms_max=%.2f "
++           "copies=%llu copy_kb=%llu old_compute_copies=%llu old_compute_kb=%llu\n",
++           (now - s->start_ns) / 1e9, (unsigned long long) s->submits,
++           s->submits ? s->submit_ns / 1e3 / s->submits : 0.0, s->submit_max_ns / 1e3, s->gap_max_ns / 1e6,
++           (unsigned long long) s->waits, (unsigned long long) s->signals,
++           (unsigned long long) s->retire_calls, s->retire_calls ? s->retire_ns / 1e3 / s->retire_calls : 0.0,
++           s->retire_max_ns / 1e3, (unsigned long long) s->retire_len_max, (unsigned long long) s->retire_freed,
++           (unsigned long long) s->rp_sysmem, (unsigned long long) s->rp_gmem, (unsigned long long) s->rp_flips,
++           (unsigned long long) s->big_sysmem, (unsigned long long) s->big_gmem, (unsigned long long) s->big_flips,
++           (unsigned long long) s->block_waits, s->block_waits ? s->block_wait_ns / 1e6 / s->block_waits : 0.0,
++           s->block_wait_max_ns / 1e6, (unsigned long long) s->copies, (unsigned long long) (s->copy_bytes >> 10),
++           (unsigned long long) s->copy_old_compute, (unsigned long long) (s->copy_old_compute_bytes >> 10));
++   fflush(s->log);
++   s->submits = s->submit_ns = s->submit_max_ns = s->gap_max_ns = 0;
++   s->waits = s->signals = 0;
++   s->retire_calls = s->retire_ns = s->retire_max_ns = s->retire_len_max = s->retire_freed = 0;
++   s->rp_sysmem = s->rp_gmem = s->rp_flips = 0;
++   s->big_sysmem = s->big_gmem = s->big_flips = 0;
++   s->block_waits = s->block_wait_ns = s->block_wait_max_ns = 0;
++   s->copies = s->copy_bytes = s->copy_old_compute = s->copy_old_compute_bytes = 0;
++   s->window_ns = now;
++}
++
++void tu_framestat_rp(uint64_t sig, bool sysmem, uint32_t width, uint32_t height);
++void tu_framestat_copy(uint64_t bytes, bool old_compute);
++
++/* Counts CmdCopyBuffer2 recordings; old_compute marks copies the pre-nocc driver sent to
++ * the compute path (all regions 16-byte aligned, 64 KiB or more in total). */
++void
++tu_framestat_copy(uint64_t bytes, bool old_compute)
++{
++   tu_framestat *s = tu_framestat_get();
++   if (!s)
++      return;
++   std::lock_guard<std::mutex> guard(s->lock);
++   s->copies++;
++   s->copy_bytes += bytes;
++   if (old_compute) {
++      s->copy_old_compute++;
++      s->copy_old_compute_bytes += bytes;
++   }
++}
++
++
++void
++tu_framestat_rp(uint64_t sig, bool sysmem, uint32_t width, uint32_t height)
++{
++   tu_framestat *s = tu_framestat_get();
++   if (!s)
++      return;
++   const bool big = (uint64_t) width * height >= 640ull * 360ull;
++   const uint8_t mode = sysmem ? 1 : 2;
++   std::lock_guard<std::mutex> guard(s->lock);
++   (sysmem ? s->rp_sysmem : s->rp_gmem)++;
++   if (big)
++      (sysmem ? s->big_sysmem : s->big_gmem)++;
++   uint8_t &last = s->last_mode[sig];
++   if (last && last != mode) {
++      s->rp_flips++;
++      if (big)
++         s->big_flips++;
++   }
++   last = mode;
++}
+ 
+ 
+ struct wddm_retired_bo {
+@@ -156,6 +262,13 @@
+    NTSTATUS status = D3DKMTWaitForSynchronizationObjectFromCpu(&wait);
+    DWORD result = status >= 0 ? WaitForSingleObject(event, timeout) : WAIT_FAILED;
+    CloseHandle(event);
++   if (tu_framestat *fs = tu_framestat_get()) {
++      const uint64_t dt = os_time_get_nano() - now;
++      std::lock_guard<std::mutex> guard(fs->lock);
++      fs->block_waits++;
++      fs->block_wait_ns += dt;
++      fs->block_wait_max_ns = MAX2(fs->block_wait_max_ns, dt);
++   }
+    MemoryBarrier();
+    if (*s->cpu == UINT64_MAX)
+       return wddm_check_status(dev);
+@@ -185,7 +298,11 @@
+    if (vk_device_is_lost_no_report(&dev->vk))
+       return;
+    auto w = dev->wddm;
++   tu_framestat *fs = tu_framestat_get();
++   const uint64_t fs_start = fs ? os_time_get_nano() : 0;
++   uint64_t fs_freed = 0;
+    AcquireSRWLockExclusive(&w->retire_lock);
++   const uint64_t fs_len = w->retired.size();
+    for (size_t i = 0; i < w->retired.size();) {
+       auto &entry = w->retired[i];
+       bool complete = true;
+@@ -200,8 +317,18 @@
+       MemoryBarrier();
+       wddm_bo_release(dev, entry.bo);
+       w->retired.erase(w->retired.begin() + i);
++      fs_freed++;
+    }
+    ReleaseSRWLockExclusive(&w->retire_lock);
++   if (fs) {
++      const uint64_t dt = os_time_get_nano() - fs_start;
++      std::lock_guard<std::mutex> guard(fs->lock);
++      fs->retire_calls++;
++      fs->retire_ns += dt;
++      fs->retire_max_ns = MAX2(fs->retire_max_ns, dt);
++      fs->retire_len_max = MAX2(fs->retire_len_max, fs_len);
++      fs->retire_freed += fs_freed;
++   }
+ }
+ 
+ static bool
+@@ -840,7 +967,7 @@
+ }
+ 
+ static VkResult
+-wddm_queue_submit(struct tu_queue *queue, void *submission,
++wddm_queue_submit_impl(struct tu_queue *queue, void *submission,
+                    struct vk_sync_wait *waits, uint32_t wait_count,
+                    struct vk_sync_signal *signals, uint32_t signal_count,
+                    struct tu_u_trace_submission_data *)
+@@ -931,6 +1058,31 @@
+    return wddm_check_status(dev);
+ }
+ 
++static VkResult
++wddm_queue_submit(struct tu_queue *queue, void *submission,
++                   struct vk_sync_wait *waits, uint32_t wait_count,
++                   struct vk_sync_signal *signals, uint32_t signal_count,
++                   struct tu_u_trace_submission_data *u_trace)
++{
++   tu_framestat *fs = tu_framestat_get();
++   if (!fs)
++      return wddm_queue_submit_impl(queue, submission, waits, wait_count, signals, signal_count, u_trace);
++   const uint64_t start = os_time_get_nano();
++   VkResult result = wddm_queue_submit_impl(queue, submission, waits, wait_count, signals, signal_count, u_trace);
++   const uint64_t now = os_time_get_nano();
++   std::lock_guard<std::mutex> guard(fs->lock);
++   fs->submits++;
++   fs->submit_ns += now - start;
++   fs->submit_max_ns = MAX2(fs->submit_max_ns, now - start);
++   if (fs->last_submit_ns)
++      fs->gap_max_ns = MAX2(fs->gap_max_ns, start - fs->last_submit_ns);
++   fs->last_submit_ns = start;
++   fs->waits += wait_count;
++   fs->signals += signal_count + 1;
++   tu_framestat_flush_locked(fs, now);
++   return result;
++}
++
+ static VkResult wddm_queue_wait(struct tu_queue *queue, uint32_t fence, uint64_t timeout)
+ {
+    if (!queue->gfx_timepoint)
+@@ -991,6 +1143,244 @@
+    return true;
+ }
+ 
++#include "tu_image.h"
++
++static VkResult
++wddm_native_import(VkDevice device, void *resource,
++                              const VkMemoryAllocateInfo *info, const VkAllocationCallbacks *alloc,
++                              VkDeviceMemory *out)
++{
++   *out = VK_NULL_HANDLE;
++   VK_FROM_HANDLE(tu_device, dev, device);
++   if (!wddm_present_queue(device) || !resource ||
++       !info->allocationSize || info->allocationSize > 64 * 1024 * 1024 ||
++       info->allocationSize % 65536)
++      return VK_ERROR_INITIALIZATION_FAILED;
++   auto texture = (ID3D12Resource *)resource;
++   auto desc = texture->GetDesc();
++   ID3D12Device *owner = NULL;
++   if (FAILED(texture->GetDevice(IID_PPV_ARGS(&owner))))
++      return VK_ERROR_INITIALIZATION_FAILED;
++   auto luid = owner->GetAdapterLuid();
++   auto allocation = owner->GetResourceAllocationInfo(0, 1, &desc);
++   owner->Release();
++   if (memcmp(&luid, &dev->physical_device->wddm_luid, sizeof(luid)) ||
++       desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
++       desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM || desc.SampleDesc.Count != 1 ||
++       desc.DepthOrArraySize != 1 || desc.MipLevels != 1 ||
++       allocation.SizeInBytes != info->allocationSize)
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   HANDLE handle = NULL;
++   if (FAILED(texture->GetDevice(IID_PPV_ARGS(&owner))))
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   HRESULT share_result = owner->CreateSharedHandle(texture, NULL, GENERIC_ALL, NULL, &handle);
++   owner->Release();
++   if (FAILED(share_result))
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   auto bo = (struct tu_bo *)calloc(1, sizeof(struct tu_bo));
++   auto mem = (struct tu_device_memory *)vk_device_memory_create(
++      &dev->vk, info, alloc, sizeof(struct tu_device_memory));
++   if (!bo || !mem) {
++      free(bo);
++      if (mem) vk_device_memory_destroy(&dev->vk, alloc, &mem->vk);
++      CloseHandle(handle);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++   bo->size = info->allocationSize;
++   D3DKMT_QUERYRESOURCEINFOFROMNTHANDLE query = {};
++   query.hDevice = dev->wddm->handle;
++   query.hNtHandle = handle;
++   NTSTATUS status = D3DKMTQueryResourceInfoFromNtHandle(&query);
++   if (status >= 0 && (query.NumAllocations != 1 ||
++       query.TotalPrivateDriverDataSize != 304 ||
++       query.PrivateRuntimeDataSize > 1048576 ||
++       query.ResourcePrivateDriverDataSize > 1048576))
++      status = (NTSTATUS)0xc000000d;
++   if (status >= 0) {
++      std::vector<uint8_t> runtime(query.PrivateRuntimeDataSize);
++      std::vector<uint8_t> private_data(query.ResourcePrivateDriverDataSize);
++      std::vector<uint8_t> allocation_data(query.TotalPrivateDriverDataSize);
++      D3DDDI_OPENALLOCATIONINFO2 ai = {};
++      D3DKMT_OPENRESOURCEFROMNTHANDLE open = {};
++      open.hDevice = dev->wddm->handle;
++      open.hNtHandle = handle;
++      open.NumAllocations = 1;
++      open.pOpenAllocationInfo2 = &ai;
++      open.PrivateRuntimeDataSize = query.PrivateRuntimeDataSize;
++      open.pPrivateRuntimeData = runtime.data();
++      open.ResourcePrivateDriverDataSize = query.ResourcePrivateDriverDataSize;
++      open.pResourcePrivateDriverData = private_data.data();
++      open.TotalPrivateDriverDataBufferSize = query.TotalPrivateDriverDataSize;
++      open.pTotalPrivateDriverDataBuffer = allocation_data.data();
++      status = D3DKMTOpenResourceFromNtHandle(&open);
++      if (status >= 0) {
++         bo->gem_handle = ai.hAllocation;
++         bo->wddm_resource = open.hResource;
++         uint32_t private_size = 0;
++         memcpy(&private_size, allocation_data.data() + 16, sizeof(private_size));
++         if (private_size != bo->size)
++            status = (NTSTATUS)0xc000000d;
++      }
++   }
++   CloseHandle(handle);
++   if (status >= 0) {
++      D3DDDI_MAPGPUVIRTUALADDRESS map = {};
++      map.hPagingQueue = dev->wddm->paging.hPagingQueue;
++      map.hAllocation = bo->gem_handle;
++      map.SizeInPages = bo->size / 4096;
++      map.MinimumAddress = dev->physical_device->va_start;
++      map.MaximumAddress = map.MinimumAddress + dev->physical_device->va_size - 1;
++      map.Protection.Write = 1;
++      status = D3DKMTMapGpuVirtualAddress(&map);
++      if (status >= 0) {
++         bo->iova = map.VirtualAddress;
++         if (!wddm_wait_paging(dev, map.PagingFenceValue))
++            status = (NTSTATUS)0xc0000001;
++      }
++   }
++   if (status >= 0) {
++      D3DDDI_MAKERESIDENT resident = {};
++      resident.hPagingQueue = dev->wddm->paging.hPagingQueue;
++      resident.NumAllocations = 1;
++      resident.AllocationList = &bo->gem_handle;
++      status = D3DKMTMakeResident(&resident);
++      if (status >= 0 && !wddm_wait_paging(dev, resident.PagingFenceValue))
++         status = (NTSTATUS)0xc0000001;
++   }
++   if (status < 0) {
++      fprintf(stderr, "DXGI_WRITE_IMPORT_FAILED status=0x%lx\n", status);
++      wddm_bo_release(dev, bo);
++      vk_device_memory_destroy(&dev->vk, alloc, &mem->vk);
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   }
++   mem->size = info->allocationSize;
++   mem->refcnt = 1;
++   mem->bo = bo;
++   mem->iova = bo->iova;
++   bo->refcnt = 1;
++   bo->base = &mem->vk.base;
++   bo->name = tu_debug_bos_add(dev, bo->size, "DXGI native tiled image");
++   tu_dump_bo_init(dev, bo);
++   p_atomic_add(&dev->physical_device->heap.used, bo->size);
++   *out = tu_device_memory_to_handle(mem);
++   fprintf(stderr, "DXGI_WRITE_IMPORT_PASS bytes=%llu write_protection=1\n", (unsigned long long)bo->size);
++   return VK_SUCCESS;
++}
++
++
++static VkResult
++wddm_native_image(VkDevice device, void *resource, VkImage image_h,
++                  const VkAllocationCallbacks *alloc, VkDeviceMemory *out)
++{
++   VK_FROM_HANDLE(tu_device, dev, device);
++   VK_FROM_HANDLE(tu_image, image, image_h);
++   auto texture = (ID3D12Resource *)resource;
++   auto desc = texture->GetDesc();
++   const auto &layout = image->layout[0];
++   ID3D12Device *owner = NULL;
++   if (FAILED(texture->GetDevice(IID_PPV_ARGS(&owner))))
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   auto allocation = owner->GetResourceAllocationInfo(0, 1, &desc);
++   owner->Release();
++   if (image->vk.format != VK_FORMAT_B8G8R8A8_UNORM ||
++       image->vk.extent.width != desc.Width || image->vk.extent.height != desc.Height ||
++       layout.tile_mode != TILE6_3 || !layout.ubwc ||
++       image->total_size > allocation.SizeInBytes || !layout.slices[0].offset ||
++       layout.ubwc_slices[0].offset || image->vk.array_layers != 1 || image->vk.mip_levels != 1)
++      return VK_ERROR_FORMAT_NOT_SUPPORTED;
++   VkMemoryAllocateInfo info = {};
++   info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++   info.allocationSize = allocation.SizeInBytes;
++   bool found = false;
++   for (uint32_t i = 0; i < dev->physical_device->memory.type_count; i++) {
++      if (dev->physical_device->memory.types[i] & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
++         info.memoryTypeIndex = i;
++         found = true;
++         break;
++      }
++   }
++   if (!found)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++   VkResult result = wddm_native_import(device, resource, &info, alloc, out);
++   if (result == VK_SUCCESS)
++      fprintf(stderr, "WSI_NATIVE_IMAGE width=%u height=%u tile=%u ubwc=%u pitch=%u offset=%llu size=%llu allocation=%llu\n",
++         image->vk.extent.width, image->vk.extent.height, (unsigned)layout.tile_mode,
++         (unsigned)layout.ubwc, fdl_pitch(&layout, 0), (unsigned long long)layout.slices[0].offset,
++         (unsigned long long)image->total_size, (unsigned long long)allocation.SizeInBytes);
++   return result;
++}
++
++static VkResult
++wddm_native_create_sync(VkDevice device, void **native, void **d3d_fence)
++{
++   VK_FROM_HANDLE(tu_device, dev, device);
++   *native = NULL;
++   *d3d_fence = NULL;
++   struct vk_sync *sync = NULL;
++   VkResult result = vk_sync_create(&dev->vk, &wddm_sync_type, (vk_sync_flags)0, 0, &sync);
++   if (result != VK_SUCCESS)
++      return result;
++   auto s = (struct wddm_sync *)sync;
++   OBJECT_ATTRIBUTES attributes = {};
++   attributes.Length = sizeof(attributes);
++   HANDLE handle = NULL;
++   HRESULT hr = E_FAIL;
++   if (D3DKMTShareObjects(1, &s->handle, &attributes, GENERIC_ALL, &handle) >= 0) {
++      hr = dev->wddm->d3d->OpenSharedHandle(handle, IID_PPV_ARGS(&s->d3d_fence));
++      CloseHandle(handle);
++   }
++   if (FAILED(hr)) {
++      vk_sync_destroy(&dev->vk, sync);
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   }
++   s->d3d_fence->AddRef();
++   *native = sync;
++   *d3d_fence = s->d3d_fence;
++   return VK_SUCCESS;
++}
++
++static VkResult
++wddm_native_copy_sync(VkDevice device, void *native, uint64_t value, struct vk_sync **out)
++{
++   VK_FROM_HANDLE(tu_device, dev, device);
++   *out = NULL;
++   auto source = (struct wddm_sync *)native;
++   OBJECT_ATTRIBUTES attributes = {};
++   attributes.Length = sizeof(attributes);
++   HANDLE handle = NULL;
++   if (!value || D3DKMTShareObjects(1, &source->handle, &attributes, GENERIC_ALL, &handle) < 0)
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   D3DKMT_OPENSYNCOBJECTFROMNTHANDLE2 open = {};
++   open.hNtHandle = handle;
++   open.hDevice = dev->wddm->handle;
++   open.MonitoredFence.EngineAffinity = 1;
++   NTSTATUS status = D3DKMTOpenSyncObjectFromNtHandle2(&open);
++   CloseHandle(handle);
++   if (status < 0)
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   auto s = (struct wddm_sync *)vk_zalloc(&dev->vk.alloc, sizeof(struct wddm_sync), 8,
++                                         VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
++   if (!s) {
++      D3DKMT_DESTROYSYNCHRONIZATIONOBJECT destroy = {};
++      destroy.hSyncObject = open.hSyncObject;
++      D3DKMTDestroySynchronizationObject(&destroy);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++   s->base.type = &wddm_sync_type;
++   s->handle = open.hSyncObject;
++   s->cpu = (volatile uint64_t *)open.MonitoredFence.FenceValueCPUVirtualAddress;
++   s->target = value;
++   *out = &s->base;
++   return VK_SUCCESS;
++}
++
++static void
++wddm_native_destroy_sync(VkDevice device, void *native)
++{
++   VK_FROM_HANDLE(tu_device, dev, device);
++   vk_sync_destroy(&dev->vk, (struct vk_sync *)native);
++}
++
+ static VkResult
+ wddm_add_adapter(struct tu_instance *instance, D3DKMT_ADAPTERINFO *adapter)
+ {
+@@ -1052,6 +1442,10 @@
+    device->wsi_device.win32.get_d3d12_command_queue = wddm_present_queue;
+    device->wsi_device.win32.get_d3d12_fence = wddm_present_fence;
+    device->wsi_device.win32.create_buffer_memory = wddm_present_buffer;
++   device->wsi_device.win32.import_native_image = wddm_native_image;
++   device->wsi_device.win32.create_native_sync = wddm_native_create_sync;
++   device->wsi_device.win32.copy_native_sync = wddm_native_copy_sync;
++   device->wsi_device.win32.destroy_native_sync = wddm_native_destroy_sync;
+    const auto available_features = device->vk.supported_features;
+    const auto available_extensions = device->vk.supported_extensions;
+    device->vk.supported_extensions = {};
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -1052,7 +1052,20 @@
+       vk_free(&chain->alloc, image->blit.cmd_buffers);
+    }
+ 
++   if (image->blit.copy_end_cmd_buffers) {
++      uint32_t count = chain->blit.queue ? 1 : wsi->queue_family_count;
++      for (uint32_t i = 0; i < count; i++) {
++         if (image->blit.copy_end_cmd_buffers[i])
++            wsi->FreeCommandBuffers(chain->device, chain->cmd_pools[i], 1,
++                                      &image->blit.copy_end_cmd_buffers[i]);
++      }
++      vk_free(&chain->alloc, image->blit.copy_end_cmd_buffers);
++   }
++
+    wsi->DestroyQueryPool(chain->device, image->query_pool, NULL);
++   if (image->blit.copy_query_pool)
++      wsi->DestroyQueryPool(chain->device, image->blit.copy_query_pool,
++                            &chain->alloc);
+ 
+    if (image->timestamp_cmd_buffers) {
+       uint32_t family_count = chain->blit.queue ? 1 : wsi->queue_family_count;
+@@ -2268,6 +2281,10 @@
+ 
+    vk_semaphore_reset_temporary(device, semaphore);
+ 
++   if (image->win32_acquire_sync && chain->wsi->win32.copy_native_sync)
++      return chain->wsi->win32.copy_native_sync(vk_device_to_handle(device),
++         image->win32_acquire_sync, image->win32_acquire_value, &semaphore->temporary);
++
+ #ifdef HAVE_LIBDRM
+    VkResult result = chain->image_info.explicit_sync ?
+       wsi_create_sync_for_image_syncobj(chain, image,
+@@ -2298,6 +2315,10 @@
+ 
+    vk_fence_reset_temporary(device, fence);
+ 
++   if (image->win32_acquire_sync && chain->wsi->win32.copy_native_sync)
++      return chain->wsi->win32.copy_native_sync(vk_device_to_handle(device),
++         image->win32_acquire_sync, image->win32_acquire_value, &fence->temporary);
++
+ #ifdef HAVE_LIBDRM
+    VkResult result = chain->image_info.explicit_sync ?
+       wsi_create_sync_for_image_syncobj(chain, image,
+@@ -2732,7 +2753,7 @@
+     */
+    {
+       STACK_ARRAY(VkCommandBufferSubmitInfo, command_buffer_infos,
+-                  pPresentInfo->swapchainCount * 2);
++                  pPresentInfo->swapchainCount * 3);
+       STACK_ARRAY(VkSemaphoreSubmitInfo, signal_semaphore_infos,
+                   pPresentInfo->swapchainCount *
+                   ARRAY_SIZE(image_signal_infos[0].semaphore_infos));
+@@ -2798,6 +2819,13 @@
+                .commandBuffer =
+                   image->blit.cmd_buffers[queue->queue_family_index],
+             };
++            if (image->blit.copy_end_cmd_buffers) {
++               command_buffer_infos[command_buffer_count++] = (VkCommandBufferSubmitInfo) {
++                  .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
++                  .commandBuffer =
++                     image->blit.copy_end_cmd_buffers[queue->queue_family_index],
++               };
++            }
+          }
+ 
+          if (needs_timing_command_buffer) {
+@@ -2854,13 +2882,19 @@
+          .semaphore = swapchain->blit.semaphores[image_index],
+       };
+ 
+-      VkCommandBufferSubmitInfo command_buffer_infos[2];
++      VkCommandBufferSubmitInfo command_buffer_infos[3];
+       uint32_t command_buffer_count = 0;
+ 
+       command_buffer_infos[command_buffer_count++] = (VkCommandBufferSubmitInfo) {
+          .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+          .commandBuffer = image->blit.cmd_buffers[0],
+       };
++      if (image->blit.copy_end_cmd_buffers) {
++         command_buffer_infos[command_buffer_count++] = (VkCommandBufferSubmitInfo) {
++            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
++            .commandBuffer = image->blit.copy_end_cmd_buffers[0],
++         };
++      }
+ 
+       if (needs_timing_command_buffer) {
+          command_buffer_infos[command_buffer_count++] = (VkCommandBufferSubmitInfo) {
+@@ -3277,6 +3311,12 @@
+           info->image_type == WSI_IMAGE_TYPE_DRM ||
+           info->image_type == WSI_IMAGE_TYPE_DXGI);
+ 
++   if (image->blit.copy_query_pool && image->blit.copy_timing_full) {
++      wsi->CmdResetQueryPool(cmd_buffer, image->blit.copy_query_pool, 0, 2);
++      wsi->CmdWriteTimestamp(cmd_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                              image->blit.copy_query_pool, 0);
++   }
++
+    VkImageMemoryBarrier img_mem_barrier = {
+       .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+       .pNext = NULL,
+@@ -3296,7 +3336,8 @@
+       },
+    };
+    wsi->CmdPipelineBarrier(cmd_buffer,
+-                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                            image->blit.linear_shared ? VK_PIPELINE_STAGE_TRANSFER_BIT :
++                                                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            0,
+                            0, NULL,
+@@ -3317,12 +3358,23 @@
+       .imageOffset = { .x = 0, .y = 0, .z = 0 },
+       .imageExtent = info->create.extent,
+    };
+-   wsi->CmdCopyImageToBuffer(cmd_buffer,
++   if (image->blit.copy_query_pool && !image->blit.copy_timing_full) {
++      wsi->CmdResetQueryPool(cmd_buffer, image->blit.copy_query_pool, 0, 2);
++      wsi->CmdWriteTimestamp(cmd_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                              image->blit.copy_query_pool, 0);
++   }
++
++   if (!image->blit.linear_shared)
++      wsi->CmdCopyImageToBuffer(cmd_buffer,
+                              image->image,
+                              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                              image->blit.buffer,
+                              1, &buffer_image_copy);
+ 
++   if (image->blit.copy_query_pool && !image->blit.copy_timing_full)
++      wsi->CmdWriteTimestamp(cmd_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                              image->blit.copy_query_pool, 1);
++
+    img_mem_barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    img_mem_barrier.dstAccessMask = 0;
+    img_mem_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+@@ -3342,14 +3394,22 @@
+       .offset = 0,
+       .size = VK_WHOLE_SIZE,
+    };
++   const VkMemoryBarrier shared_mem_barrier = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++      .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++      .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
++   };
+    wsi->CmdPipelineBarrier(cmd_buffer,
+-                           VK_PIPELINE_STAGE_TRANSFER_BIT,
++                            image->blit.linear_shared ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT :
++                                                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            image->blit.to_foreign_queue
+                               ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
+                               : VK_PIPELINE_STAGE_HOST_BIT,
+                            0,
+-                           0, NULL,
+-                           1, &buf_mem_barrier,
++                            image->blit.linear_shared ? 1 : 0,
++                            image->blit.linear_shared ? &shared_mem_barrier : NULL,
++                            image->blit.linear_shared ? 0 : 1,
++                            image->blit.linear_shared ? NULL : &buf_mem_barrier,
+                            1, &img_mem_barrier);
+ }
+ 
+@@ -3465,6 +3525,14 @@
+    if (!image->blit.cmd_buffers)
+       return VK_ERROR_OUT_OF_HOST_MEMORY;
+ 
++   if (image->blit.copy_query_pool && image->blit.copy_timing_full) {
++      image->blit.copy_end_cmd_buffers =
++         vk_zalloc(&chain->alloc, sizeof(VkCommandBuffer) * cmd_buffer_count,
++                   8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++      if (!image->blit.copy_end_cmd_buffers)
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++
+    for (uint32_t i = 0; i < cmd_buffer_count; i++) {
+       if (!chain->cmd_pools[i])
+          continue;
+@@ -3508,6 +3576,21 @@
+       result = wsi->EndCommandBuffer(cmd_buffer);
+       if (result != VK_SUCCESS)
+          return result;
++
++      if (image->blit.copy_end_cmd_buffers) {
++         VkCommandBuffer *end_cmd = &image->blit.copy_end_cmd_buffers[i];
++         result = wsi->AllocateCommandBuffers(chain->device, &cmd_buffer_info, end_cmd);
++         if (result != VK_SUCCESS)
++            return result;
++         result = wsi->BeginCommandBuffer(*end_cmd, &begin_info);
++         if (result != VK_SUCCESS)
++            return result;
++         wsi->CmdWriteTimestamp(*end_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                                 image->blit.copy_query_pool, 1);
++         result = wsi->EndCommandBuffer(*end_cmd);
++         if (result != VK_SUCCESS)
++            return result;
++      }
+    }
+ 
+    return VK_SUCCESS;
+--- a/src/vulkan/wsi/wsi_common.h
++++ b/src/vulkan/wsi/wsi_common.h
+@@ -23,6 +23,8 @@
+ #ifndef WSI_COMMON_H
+ #define WSI_COMMON_H
+ 
++struct vk_sync;
++
+ #include <stdint.h>
+ #include <stdbool.h>
+ 
+@@ -139,6 +141,10 @@
+    } x11;
+ 
+    struct {
++      VkResult (*import_native_image)(VkDevice, void *, VkImage, const VkAllocationCallbacks *, VkDeviceMemory *);
++      VkResult (*create_native_sync)(VkDevice, void **, void **);
++      VkResult (*copy_native_sync)(VkDevice, void *, uint64_t, struct vk_sync **);
++      void (*destroy_native_sync)(VkDevice, void *);
+       void *(*get_d3d12_command_queue)(VkDevice device);
+       void *(*get_d3d12_fence)(VkDevice device, VkFence fence, uint64_t *value);
+       VkResult (*create_buffer_memory)(VkDevice device,
+--- a/src/vulkan/wsi/wsi_common_private.h
++++ b/src/vulkan/wsi/wsi_common_private.h
+@@ -76,6 +76,7 @@
+ struct wsi_dxgi_image_params {
+    struct wsi_base_image_params base;
+    bool storage_image;
++   bool native_tiled;
+ };
+ 
+ typedef uint32_t (*wsi_memory_type_select_cb)(const struct wsi_device *wsi,
+@@ -120,6 +121,8 @@
+ 
+    /* For buffer blit images, the size of the buffer in bytes */
+    uint64_t linear_size;
++   bool win32_linear_shared;
++   bool win32_native_tiled;
+ 
+    wsi_memory_type_select_cb select_image_memory_type;
+    wsi_memory_type_select_cb select_blit_dst_memory_type;
+@@ -165,12 +168,18 @@
+ struct wsi_image {
+    VkImage image;
+    VkDeviceMemory memory;
++   void *win32_acquire_sync;
++   uint64_t win32_acquire_value;
+ 
+    struct {
+       VkBuffer buffer;
+       VkImage image;
+       VkDeviceMemory memory;
+       VkCommandBuffer *cmd_buffers;
++      VkCommandBuffer *copy_end_cmd_buffers;
++      VkQueryPool copy_query_pool;
++      bool linear_shared;
++      bool copy_timing_full;
+       /* Whether the backing memory of the blit dst buffer is shared directly
+        * with the compositor instead of being mapped via vkMapMemory locally.
+        */
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright © 2015 Intel Corporation
++ * Copyright 짤 2015 Intel Corporation
+  *
+  * Permission is hereby granted, free of charge, to any person obtaining a
+  * copy of this software and associated documentation files (the "Software"),
+@@ -48,6 +48,13 @@
+ 
+ struct wsi_win32;
+ 
++static bool
++wsi_win32_option_enabled(const char *name)
++{
++   const char *value = getenv(name);
++   return value && !strcmp(value, "1");
++}
++
+ struct wsi_win32 {
+    struct wsi_interface                     base;
+ 
+@@ -67,6 +74,20 @@
+    WSI_IMAGE_QUEUED,
+ };
+ 
++#define WSI_WIN32_VERIFY_MAX_SAMPLES 4
++
++struct wsi_win32_verify_sample {
++   uint64_t serial;
++   uint64_t hash;
++   uint32_t first_pixel;
++   uint32_t center_pixel;
++   uint32_t last_pixel;
++   HRESULT result;
++};
++
++#include "gpu_profile.hpp"
++struct NativeGpuProfile;
++
+ struct wsi_win32_image {
+    struct wsi_image base;
+    enum wsi_win32_image_state state;
+@@ -77,8 +98,26 @@
+       ID3D12CommandAllocator *allocator;
+       ID3D12GraphicsCommandList *list;
+       ID3D12Fence *complete;
++      ID3D12Fence *acquire_fence;
++      ID3D12CommandAllocator *acquire_allocator;
++      ID3D12GraphicsCommandList *acquire_list;
++      ID3D12DescriptorHeap *rtv_heap;
++      NativeGpuProfile *profile;
++      bool native_prepared;
++      bool native_initialized;
+       uint64_t serial;
+       HANDLE event;
++      ID3D12QueryHeap *copy_query_heap;
++      ID3D12Resource *copy_query_readback;
++      uint64_t copy_timing_collected_serial;
++      ID3D12Resource *verify_readback;
++      D3D12_PLACED_SUBRESOURCE_FOOTPRINT verify_footprint;
++      uint64_t verify_size;
++      uint64_t verify_pending_serial;
++      uint64_t verify_collected_serial;
++      uint32_t verify_submitted;
++      uint32_t verify_collected;
++      struct wsi_win32_verify_sample verify_samples[WSI_WIN32_VERIFY_MAX_SAMPLES];
+    } dxgi;
+    struct {
+       HDC dc;
+@@ -114,9 +153,33 @@
+    struct wsi_image *image;
+ };
+ 
++#define WSI_WIN32_COPY_TIMING_MAX_SAMPLES 512
++
++struct wsi_win32_copy_timing_sample {
++   uint32_t image_index;
++   uint64_t serial;
++   uint64_t vk_results[4];
++   VkResult vk_result;
++   uint64_t d3d_results[2];
++   bool d3d_valid;
++};
++
+ struct wsi_win32_swapchain {
+    struct wsi_swapchain         base;
+    IDXGISwapChain3            *dxgi;
++   HANDLE native_latency;
++   bool native_latency_ready;
++   uint32_t native_max_latency;
++   bool native_wait_stats;
++   uint64_t native_stats_start;
++   uint64_t native_acquires;
++   uint64_t native_presents;
++   uint64_t native_latency_ns;
++   uint64_t native_reuse_ns;
++   uint64_t native_present_ns;
++   uint64_t native_latency_max;
++   uint64_t native_reuse_max;
++   uint64_t native_present_max;
+    struct wsi_win32           *wsi;
+    wsi_win32_surface          *surface;
+    mtx_t                      acquire_mutex;
+@@ -130,9 +193,305 @@
+    struct wsi_win32_present *present_tail;
+    uint64_t completed_id;
+    struct wsi_image_timing_request timing_request;
++   bool copy_timing_requested;
++   bool copy_timing_full;
++   bool verify_requested;
++   struct wsi_win32_copy_timing_sample *copy_timing_samples;
++   uint32_t copy_timing_sample_count;
++   uint64_t copy_timing_observations;
++   uint64_t copy_timing_frequency;
++   uint32_t copy_timing_initialized_images;
++   uint32_t copy_timing_setup_failures;
++   VkResult copy_timing_vk_error;
++   HRESULT copy_timing_hr;
+    struct wsi_win32_image     images[0];
+ };
+ 
++#include "native_gpu_profile.inc"
++
++static void
++wsi_native_report_waits(struct wsi_win32_swapchain *chain, bool final)
++{
++   if (!chain->native_wait_stats || !chain->native_stats_start)
++      return;
++   uint64_t now = os_time_get_nano();
++   uint64_t elapsed = now - chain->native_stats_start;
++   if (!final && elapsed < 5000000000ULL)
++      return;
++   if (chain->native_acquires || chain->native_presents)
++      fprintf(stderr, "WSI_NATIVE_WAIT_SUMMARY chain=%p final=%u latency=%u width=%u height=%u window_s=%.3f acquires=%llu presents=%llu admission_ms=%.3f admission_max_ms=%.3f reuse_ms=%.3f reuse_max_ms=%.3f present_call_ms=%.3f present_call_max_ms=%.3f scope=cpu_call_wall_time\n",
++         (void *)chain, (unsigned)final, chain->native_max_latency,
++         chain->extent.width, chain->extent.height, elapsed / 1e9,
++         (unsigned long long)chain->native_acquires, (unsigned long long)chain->native_presents,
++         chain->native_latency_ns / 1e6, chain->native_latency_max / 1e6,
++         chain->native_reuse_ns / 1e6, chain->native_reuse_max / 1e6,
++         chain->native_present_ns / 1e6, chain->native_present_max / 1e6);
++   chain->native_stats_start = now;
++   chain->native_acquires = chain->native_presents = 0;
++   chain->native_latency_ns = chain->native_reuse_ns = chain->native_present_ns = 0;
++   chain->native_latency_max = chain->native_reuse_max = chain->native_present_max = 0;
++}
++
++static void
++wsi_win32_collect_verify(struct wsi_win32_image *image)
++{
++   if (!image->dxgi.verify_readback || !image->dxgi.verify_pending_serial ||
++       image->dxgi.verify_pending_serial == image->dxgi.verify_collected_serial ||
++       image->dxgi.verify_collected >= WSI_WIN32_VERIFY_MAX_SAMPLES)
++      return;
++   auto chain = image->chain;
++   auto sample = &image->dxgi.verify_samples[image->dxgi.verify_collected++];
++   sample->serial = image->dxgi.verify_pending_serial;
++   image->dxgi.verify_collected_serial = sample->serial;
++   D3D12_RANGE read_range = {0, (SIZE_T)image->dxgi.verify_size};
++   void *mapped = NULL;
++   sample->result = image->dxgi.verify_readback->Map(0, &read_range, &mapped);
++   if (FAILED(sample->result))
++      return;
++   const uint8_t *pixels = (const uint8_t *)mapped + image->dxgi.verify_footprint.Offset;
++   uint64_t hash = 14695981039346656037ULL;
++   uint32_t pitch = image->dxgi.verify_footprint.Footprint.RowPitch;
++   for (uint32_t y = 0; y < chain->extent.height; y++) {
++      const uint8_t *row = pixels + (size_t)y * pitch;
++      for (uint32_t x = 0; x < chain->extent.width * 4; x++) {
++         hash ^= row[x];
++         hash *= 1099511628211ULL;
++      }
++   }
++   sample->hash = hash;
++   memcpy(&sample->first_pixel, pixels, 4);
++   memcpy(&sample->center_pixel,
++          pixels + (size_t)(chain->extent.height / 2) * pitch +
++             (chain->extent.width / 2) * 4, 4);
++   memcpy(&sample->last_pixel,
++          pixels + (size_t)(chain->extent.height - 1) * pitch +
++             (chain->extent.width - 1) * 4, 4);
++   D3D12_RANGE write_range = {0, 0};
++   image->dxgi.verify_readback->Unmap(0, &write_range);
++}
++
++static VkResult
++wsi_win32_init_verify(struct wsi_win32_swapchain *chain,
++                        struct wsi_win32_image *image, ID3D12Device *device)
++{
++   if (!chain->verify_requested)
++      return VK_SUCCESS;
++   D3D12_RESOURCE_DESC texture = image->dxgi.swapchain_res->GetDesc();
++   UINT rows = 0;
++   UINT64 row_size = 0, size = 0;
++   device->GetCopyableFootprints(&texture, 0, 1, 0,
++                                   &image->dxgi.verify_footprint,
++                                   &rows, &row_size, &size);
++   if (!size || size > 64ULL * 1024 * 1024 || rows != chain->extent.height ||
++       row_size != (uint64_t)chain->extent.width * 4 ||
++       image->dxgi.verify_footprint.Footprint.Depth != 1) {
++      fprintf(stderr, "WSI_VERIFY_REJECT reason=footprint size=%llu rows=%u row_bytes=%llu\n",
++              (unsigned long long)size, rows, (unsigned long long)row_size);
++      return VK_ERROR_FORMAT_NOT_SUPPORTED;
++   }
++   D3D12_HEAP_PROPERTIES heap = {};
++   heap.Type = D3D12_HEAP_TYPE_READBACK;
++   heap.CreationNodeMask = heap.VisibleNodeMask = 1;
++   D3D12_RESOURCE_DESC desc = {};
++   desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++   desc.Width = size;
++   desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
++   desc.SampleDesc.Count = 1;
++   desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++   HRESULT hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
++                                                  &desc, D3D12_RESOURCE_STATE_COPY_DEST,
++                                                  NULL, IID_PPV_ARGS(&image->dxgi.verify_readback));
++   if (FAILED(hr)) {
++      fprintf(stderr, "WSI_VERIFY_REJECT reason=readback_allocation hr=%lx\n", (unsigned long)hr);
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   }
++   image->dxgi.verify_size = size;
++   return VK_SUCCESS;
++}
++
++static void
++wsi_win32_report_verify(struct wsi_win32_image *image)
++{
++   if (!image->chain || !image->chain->verify_requested)
++      return;
++   auto chain = image->chain;
++   uint32_t index = image - chain->images;
++   for (uint32_t i = 0; i < image->dxgi.verify_collected; i++) {
++      const auto sample = &image->dxgi.verify_samples[i];
++      fprintf(stderr, "WSI_VERIFY image=%u serial=%llu width=%u height=%u format=%u linear_shared=%u row_pitch=%u bytes=%llu map_hr=%lx fnv1a64=%016llx first=%08x center=%08x last=%08x\n",
++              index, (unsigned long long)sample->serial, chain->extent.width,
++              chain->extent.height, (unsigned)chain->base.image_info.create.format,
++              (unsigned)image->base.blit.linear_shared,
++              image->dxgi.verify_footprint.Footprint.RowPitch,
++              (unsigned long long)chain->extent.width * chain->extent.height * 4,
++              (unsigned long)sample->result, (unsigned long long)sample->hash,
++              sample->first_pixel, sample->center_pixel, sample->last_pixel);
++   }
++}
++
++static void
++wsi_win32_init_copy_timing(struct wsi_win32_swapchain *chain,
++                            struct wsi_win32_image *image,
++                            ID3D12Device *device)
++{
++   if (!chain->copy_timing_samples)
++      return;
++
++   const struct wsi_device *wsi = chain->base.wsi;
++   bool supported = !chain->base.blit.queue &&
++                    wsi->timestamp_period > 0.0f &&
++                    wsi->timestamp_bits > 0 && wsi->timestamp_bits <= 64;
++   for (uint32_t i = 0; i < wsi->queue_family_count && supported; i++) {
++      if (chain->base.cmd_pools[i] &&
++          !(wsi->queue_supports_timestamps & BITFIELD64_BIT(i)))
++         supported = false;
++   }
++   if (!supported) {
++      chain->copy_timing_setup_failures++;
++      chain->copy_timing_vk_error = VK_ERROR_FEATURE_NOT_PRESENT;
++      return;
++   }
++
++   auto queue = (ID3D12CommandQueue *)wsi->win32.get_d3d12_command_queue(chain->base.device);
++   UINT64 frequency = 0;
++   HRESULT hr = queue ? queue->GetTimestampFrequency(&frequency) : E_FAIL;
++   if (SUCCEEDED(hr) && !frequency)
++      hr = E_FAIL;
++   D3D12_QUERY_HEAP_DESC query_desc = {};
++   query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
++   query_desc.Count = 2;
++   if (SUCCEEDED(hr))
++      hr = device->CreateQueryHeap(&query_desc,
++                                    IID_PPV_ARGS(&image->dxgi.copy_query_heap));
++
++   D3D12_HEAP_PROPERTIES heap = {};
++   heap.Type = D3D12_HEAP_TYPE_READBACK;
++   heap.CreationNodeMask = heap.VisibleNodeMask = 1;
++   D3D12_RESOURCE_DESC desc = {};
++   desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++   desc.Width = 2 * sizeof(uint64_t);
++   desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
++   desc.SampleDesc.Count = 1;
++   desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++   if (SUCCEEDED(hr))
++      hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
++                                             &desc, D3D12_RESOURCE_STATE_COPY_DEST,
++                                             NULL, IID_PPV_ARGS(&image->dxgi.copy_query_readback));
++
++   VkResult result = VK_SUCCESS;
++   if (SUCCEEDED(hr)) {
++      VkQueryPoolCreateInfo query_info = {};
++      query_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
++      query_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
++      query_info.queryCount = 2;
++      result = wsi->CreateQueryPool(chain->base.device, &query_info,
++                                     &chain->base.alloc, &image->base.blit.copy_query_pool);
++   }
++   if (SUCCEEDED(hr) && result == VK_SUCCESS) {
++      image->base.blit.copy_timing_full = chain->copy_timing_full;
++      chain->copy_timing_frequency = frequency;
++      chain->copy_timing_initialized_images++;
++      return;
++   }
++
++   chain->copy_timing_setup_failures++;
++   chain->copy_timing_vk_error = result;
++   chain->copy_timing_hr = hr;
++   if (image->dxgi.copy_query_readback) {
++      image->dxgi.copy_query_readback->Release();
++      image->dxgi.copy_query_readback = NULL;
++   }
++   if (image->dxgi.copy_query_heap) {
++      image->dxgi.copy_query_heap->Release();
++      image->dxgi.copy_query_heap = NULL;
++   }
++   image->base.blit.copy_query_pool = VK_NULL_HANDLE;
++}
++
++static void
++wsi_win32_collect_copy_timing(struct wsi_win32_image *image)
++{
++   wsi_win32_collect_verify(image);
++   if (!image->dxgi.copy_query_heap ||
++       image->dxgi.serial == image->dxgi.copy_timing_collected_serial)
++      return;
++
++   struct wsi_win32_swapchain *chain = image->chain;
++   image->dxgi.copy_timing_collected_serial = image->dxgi.serial;
++   chain->copy_timing_observations++;
++   if (chain->copy_timing_sample_count >= WSI_WIN32_COPY_TIMING_MAX_SAMPLES)
++      return;
++
++   auto sample = &chain->copy_timing_samples[chain->copy_timing_sample_count++];
++   sample->image_index = image - chain->images;
++   sample->serial = image->dxgi.serial;
++   sample->vk_result = chain->base.wsi->GetQueryPoolResults(
++      chain->base.device, image->base.blit.copy_query_pool, 0, 2,
++      sizeof(sample->vk_results), sample->vk_results, 2 * sizeof(uint64_t),
++      VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
++
++   D3D12_RANGE read_range = {0, sizeof(sample->d3d_results)};
++   void *mapped = NULL;
++   if (SUCCEEDED(image->dxgi.copy_query_readback->Map(0, &read_range, &mapped))) {
++      memcpy(sample->d3d_results, mapped, sizeof(sample->d3d_results));
++      D3D12_RANGE write_range = {0, 0};
++      image->dxgi.copy_query_readback->Unmap(0, &write_range);
++      sample->d3d_valid = sample->d3d_results[1] >= sample->d3d_results[0];
++   }
++}
++
++static void
++wsi_win32_report_copy_timing(struct wsi_win32_swapchain *chain)
++{
++   if (!chain->copy_timing_requested)
++      return;
++
++   const struct wsi_device *wsi = chain->base.wsi;
++   fprintf(stderr,
++           "WSI_COPY_TIMING_BEGIN chain=%p width=%u height=%u format=%u samples=%u observed=%llu initialized_images=%u failed_images=%u vk_setup_result=%d d3d_setup_hr=%lx vk_period_ns=%.9f vk_valid_bits=%u d3d_hz=%llu sample_limit=%u scope=%s linear_shared=%u\n",
++           (void *)chain, chain->extent.width, chain->extent.height,
++           (unsigned)chain->base.image_info.create.format,
++           chain->copy_timing_sample_count,
++           (unsigned long long)chain->copy_timing_observations,
++           chain->copy_timing_initialized_images, chain->copy_timing_setup_failures,
++           chain->copy_timing_vk_error, (unsigned long)chain->copy_timing_hr,
++           (double)wsi->timestamp_period, wsi->timestamp_bits,
++           (unsigned long long)chain->copy_timing_frequency,
++           WSI_WIN32_COPY_TIMING_MAX_SAMPLES,
++           chain->copy_timing_full ? "wsi_commands_and_end_flush" : "copy_only_all_commands",
++           (unsigned)chain->base.image_info.win32_linear_shared);
++   uint64_t mask = wsi->timestamp_bits > 0 && wsi->timestamp_bits < 64 ?
++      UINT64_MAX >> (64 - wsi->timestamp_bits) : UINT64_MAX;
++   for (uint32_t i = 0; i < chain->copy_timing_sample_count; i++) {
++      const auto sample = &chain->copy_timing_samples[i];
++      bool vk_valid = sample->vk_result == VK_SUCCESS &&
++                      sample->vk_results[1] && sample->vk_results[3];
++      double vk_us = vk_valid ?
++         (double)((sample->vk_results[2] - sample->vk_results[0]) & mask) *
++            wsi->timestamp_period / 1000.0 : -1.0;
++      double d3d_us = sample->d3d_valid && chain->copy_timing_frequency ?
++         (double)(sample->d3d_results[1] - sample->d3d_results[0]) *
++            1000000.0 / (double)chain->copy_timing_frequency : -1.0;
++      fprintf(stderr,
++              "WSI_COPY_TIMING sample=%u image=%u serial=%llu row_pitch=%u payload_bytes=%llu vk_result=%d vk_available0=%llu vk_available1=%llu vk_start=%llu vk_end=%llu vk_us=%.6f d3d_valid=%u d3d_start=%llu d3d_end=%llu d3d_us=%.6f\n",
++              i, sample->image_index, (unsigned long long)sample->serial,
++              chain->images[sample->image_index].base.row_pitches[0],
++              (unsigned long long)chain->extent.width * chain->extent.height *
++                 vk_format_get_blocksize(chain->base.image_info.create.format),
++              sample->vk_result, (unsigned long long)sample->vk_results[1],
++              (unsigned long long)sample->vk_results[3],
++              (unsigned long long)sample->vk_results[0],
++              (unsigned long long)sample->vk_results[2], vk_us,
++              (unsigned)sample->d3d_valid,
++              (unsigned long long)sample->d3d_results[0],
++              (unsigned long long)sample->d3d_results[1], d3d_us);
++   }
++   fprintf(stderr, "WSI_COPY_TIMING_END chain=%p\n", (void *)chain);
++   fflush(stderr);
++   free(chain->copy_timing_samples);
++   chain->copy_timing_samples = NULL;
++}
++
+ VKAPI_ATTR VkBool32 VKAPI_CALL
+ wsi_GetPhysicalDeviceWin32PresentationSupportKHR(VkPhysicalDevice physicalDevice,
+                                                  uint32_t queueFamilyIndex)
+@@ -510,6 +869,82 @@
+ }
+ 
+ static VkResult
++wsi_create_dxgi_linear_image_mem(const struct wsi_swapchain *chain,
++                                   const struct wsi_image_info *info,
++                                   struct wsi_win32_image *image)
++{
++   const struct wsi_device *wsi = chain->wsi;
++   VkMemoryRequirements reqs;
++   wsi->GetImageMemoryRequirements(chain->device, image->base.image, &reqs);
++   VkImageSubresource subresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
++   VkSubresourceLayout layout = {};
++   wsi->GetImageSubresourceLayout(chain->device, image->base.image,
++                                   &subresource, &layout);
++   uint64_t row_bytes = (uint64_t)info->create.extent.width * 4;
++   uint64_t height = info->create.extent.height;
++   bool valid = reqs.size && reqs.size <= UINT32_MAX - 65535 &&
++                layout.offset <= reqs.size &&
++                !(layout.offset % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT) &&
++                layout.rowPitch && layout.rowPitch <= UINT32_MAX &&
++                !(layout.rowPitch % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) &&
++                layout.rowPitch >= row_bytes && height &&
++                height <= (reqs.size - layout.offset) / layout.rowPitch &&
++                height <= layout.size / layout.rowPitch;
++   if (!valid) {
++      fprintf(stderr, "WSI_LINEAR_SHARED_REJECT reason=layout allocation=%llu offset=%llu pitch=%llu subresource_size=%llu width=%u height=%u\n",
++              (unsigned long long)reqs.size, (unsigned long long)layout.offset,
++              (unsigned long long)layout.rowPitch, (unsigned long long)layout.size,
++              info->create.extent.width, info->create.extent.height);
++      return VK_ERROR_FORMAT_NOT_SUPPORTED;
++   }
++   uint32_t memory_type = info->select_image_memory_type(wsi, reqs.memoryTypeBits);
++   if (memory_type >= wsi->memory_props.memoryTypeCount ||
++       !(reqs.memoryTypeBits & (1u << memory_type))) {
++      fprintf(stderr, "WSI_LINEAR_SHARED_REJECT reason=memory_type\n");
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++   }
++   VkMemoryDedicatedAllocateInfo dedicated = {};
++   dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
++   dedicated.image = image->base.image;
++   VkMemoryAllocateInfo allocation = {};
++   allocation.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++   allocation.pNext = &dedicated;
++   allocation.allocationSize = reqs.size;
++   allocation.memoryTypeIndex = memory_type;
++   VkResult result = wsi->win32.create_buffer_memory(
++      chain->device, &allocation, &chain->alloc,
++      (void **)&image->dxgi.buffer, &image->base.memory);
++   if (result != VK_SUCCESS) {
++      fprintf(stderr, "WSI_LINEAR_SHARED_REJECT reason=shared_allocation result=%d\n", result);
++      return result;
++   }
++   D3D12_RESOURCE_DESC buffer_desc = image->dxgi.buffer->GetDesc();
++   D3D12_RESOURCE_DESC texture_desc = image->dxgi.swapchain_res->GetDesc();
++   DXGI_FORMAT expected_format = info->create.format == VK_FORMAT_R8G8B8A8_UNORM ?
++      DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
++   if (buffer_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
++       buffer_desc.Width < reqs.size || texture_desc.Format != expected_format ||
++       texture_desc.Width != info->create.extent.width ||
++       texture_desc.Height != height || texture_desc.SampleDesc.Count != 1 ||
++       texture_desc.DepthOrArraySize != 1) {
++      fprintf(stderr, "WSI_LINEAR_SHARED_REJECT reason=d3d_resource_shape\n");
++      return VK_ERROR_FORMAT_NOT_SUPPORTED;
++   }
++   image->base.blit.linear_shared = true;
++   image->base.num_planes = 1;
++   image->base.sizes[0] = reqs.size;
++   image->base.offsets[0] = layout.offset;
++   image->base.row_pitches[0] = layout.rowPitch;
++   fprintf(stderr, "WSI_LINEAR_SHARED_IMAGE width=%u height=%u format=%u usage=%llu offset=%llu row_pitch=%llu image_size=%llu allocation=%llu d3d_buffer_size=%llu owner=image_memory\n",
++           info->create.extent.width, info->create.extent.height,
++           (unsigned)info->create.format, (unsigned long long)info->usage2.usage,
++           (unsigned long long)layout.offset, (unsigned long long)layout.rowPitch,
++           (unsigned long long)layout.size, (unsigned long long)reqs.size,
++           (unsigned long long)buffer_desc.Width);
++   return VK_SUCCESS;
++}
++
++static VkResult
+ wsi_create_dxgi_image_mem(const struct wsi_swapchain *drv_chain,
+                           const struct wsi_image_info *info,
+                           struct wsi_image *image)
+@@ -526,8 +961,45 @@
+                                      IID_PPV_ARGS(&win32_image->dxgi.swapchain_res))))
+       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+ 
++
++   if (info->win32_native_tiled) {
++      VkResult result = wsi->win32.import_native_image(chain->base.device,
++         win32_image->dxgi.swapchain_res, image->image, &chain->base.alloc, &image->memory);
++      if (result != VK_SUCCESS)
++         return result;
++      ID3D12Device *device = NULL;
++      HRESULT hr = win32_image->dxgi.swapchain_res->GetDevice(IID_PPV_ARGS(&device));
++      if (FAILED(hr))
++         return VK_ERROR_DEVICE_LOST;
++      hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&win32_image->dxgi.allocator));
++      if (SUCCEEDED(hr)) hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, win32_image->dxgi.allocator, NULL, IID_PPV_ARGS(&win32_image->dxgi.list));
++      if (SUCCEEDED(hr)) hr = win32_image->dxgi.list->Close();
++      if (SUCCEEDED(hr)) hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&win32_image->dxgi.acquire_allocator));
++      if (SUCCEEDED(hr)) hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, win32_image->dxgi.acquire_allocator, NULL, IID_PPV_ARGS(&win32_image->dxgi.acquire_list));
++      if (SUCCEEDED(hr)) hr = win32_image->dxgi.acquire_list->Close();
++      if (SUCCEEDED(hr)) hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&win32_image->dxgi.complete));
++      D3D12_DESCRIPTOR_HEAP_DESC heap = {};
++      heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
++      heap.NumDescriptors = 1;
++      if (SUCCEEDED(hr)) hr = device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&win32_image->dxgi.rtv_heap));
++      if (SUCCEEDED(hr)) device->CreateRenderTargetView(win32_image->dxgi.swapchain_res, NULL, win32_image->dxgi.rtv_heap->GetCPUDescriptorHandleForHeapStart());
++      if (SUCCEEDED(hr)) result = wsi->win32.create_native_sync(chain->base.device,
++         &image->win32_acquire_sync, (void **)&win32_image->dxgi.acquire_fence);
++      if (SUCCEEDED(hr) && result == VK_SUCCESS) result = wsi_win32_init_verify(chain, win32_image, device);
++      if (SUCCEEDED(hr) && result == VK_SUCCESS && GpuProfile::Enabled()) {
++         win32_image->dxgi.profile = new (std::nothrow) NativeGpuProfile();
++         auto q = (ID3D12CommandQueue *)wsi->win32.get_d3d12_command_queue(chain->base.device);
++         if(win32_image->dxgi.profile && q) win32_image->dxgi.profile->Init(device,q);
++      }
++      device->Release();
++      win32_image->dxgi.event = CreateEventW(NULL, FALSE, FALSE, NULL);
++      return FAILED(hr) || !win32_image->dxgi.event ? VK_ERROR_OUT_OF_HOST_MEMORY : result;
++   }
++
+    if (chain->base.blit.type == WSI_SWAPCHAIN_BUFFER_BLIT) {
+-      VkResult result = wsi_create_buffer_blit_context(drv_chain, info, image, 0);
++      VkResult result = info->win32_linear_shared ?
++         wsi_create_dxgi_linear_image_mem(drv_chain, info, win32_image) :
++         wsi_create_buffer_blit_context(drv_chain, info, image, 0);
+       if (result != VK_SUCCESS)
+          return result;
+       ID3D12Device *device = NULL;
+@@ -545,7 +1017,13 @@
+       if (SUCCEEDED(hr))
+          hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                   IID_PPV_ARGS(&win32_image->dxgi.complete));
++      if (SUCCEEDED(hr))
++         wsi_win32_init_copy_timing(chain, win32_image, device);
++      if (SUCCEEDED(hr))
++         result = wsi_win32_init_verify(chain, win32_image, device);
+       device->Release();
++      if (result != VK_SUCCESS)
++         return result;
+       win32_image->dxgi.event = CreateEventW(NULL, FALSE, FALSE, NULL);
+       return SUCCEEDED(hr) && win32_image->dxgi.event ?
+          VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
+@@ -603,6 +1081,8 @@
+                           const struct wsi_dxgi_image_params *params,
+                           VkDevice device)
+ {
++   if (params->native_tiled)
++      return WSI_SWAPCHAIN_NO_BLIT;
+    if (wsi->win32.create_buffer_memory)
+       return WSI_SWAPCHAIN_BUFFER_BLIT;
+    if (wsi->win32.requires_blits && wsi->win32.requires_blits(device))
+@@ -624,6 +1104,12 @@
+       return result;
+ 
+    info->create_mem = wsi_create_dxgi_image_mem;
++   info->win32_native_tiled = params->native_tiled;
++   if (params->native_tiled) {
++      fprintf(stderr, "WSI_NATIVE_MODE requested=1 active=1 format=%u width=%u height=%u\n",
++         (unsigned)pCreateInfo->imageFormat, pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height);
++      return VK_SUCCESS;
++   }
+ 
+    if (chain->blit.type != WSI_SWAPCHAIN_NO_BLIT) {
+       if (chain->blit.type == WSI_SWAPCHAIN_BUFFER_BLIT) {
+@@ -636,6 +1122,93 @@
+       info->select_blit_dst_memory_type = wsi_select_device_memory_type;
+    }
+ 
++   const bool linear_shared = wsi_win32_option_enabled("TU_WSI_LINEAR_SHARED") &&
++      !wsi_win32_option_enabled("TU_WSI_NATIVE_TILED");
++   const bool verify = wsi_win32_option_enabled("TU_WSI_VERIFY");
++   if (verify && wsi_win32_option_enabled("TU_WSI_COPY_TIMING")) {
++      fprintf(stderr, "WSI_PROTOTYPE_REJECT reason=verify_and_timing_are_exclusive\n");
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++   }
++   bool configuration_supported =
++      chain->blit.type == WSI_SWAPCHAIN_BUFFER_BLIT &&
++      chain->wsi->win32.create_buffer_memory && !pCreateInfo->flags &&
++      pCreateInfo->imageArrayLayers == 1 && pCreateInfo->minImageCount <= 8 &&
++      pCreateInfo->imageSharingMode == VK_SHARING_MODE_EXCLUSIVE &&
++      (pCreateInfo->imageFormat == VK_FORMAT_R8G8B8A8_UNORM ||
++       pCreateInfo->imageFormat == VK_FORMAT_B8G8R8A8_UNORM) &&
++      !info->img_compr_ctrl.sType;
++   if (verify && !configuration_supported)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++   if (!linear_shared) {
++      fprintf(stderr, "WSI_LINEAR_SHARED_MODE requested=0 active=0 reason=baseline\n");
++      return VK_SUCCESS;
++   }
++   if (!configuration_supported) {
++      fprintf(stderr, "WSI_LINEAR_SHARED_MODE requested=1 active=0 reason=unsupported_configuration format=%u\n",
++              (unsigned)pCreateInfo->imageFormat);
++      return VK_SUCCESS;
++   }
++   if (info->usage2.usage > UINT32_MAX) {
++      fprintf(stderr, "WSI_LINEAR_SHARED_MODE requested=1 active=0 reason=usage_width\n");
++      return VK_SUCCESS;
++   }
++   VkPhysicalDeviceImageFormatInfo2 query = {};
++   query.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
++   query.format = info->create.format;
++   query.type = info->create.imageType;
++   query.tiling = VK_IMAGE_TILING_LINEAR;
++   query.usage = info->usage2.usage;
++   query.flags = info->create.flags;
++   VkImageFormatProperties2 properties = {};
++   properties.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
++   result = chain->wsi->GetPhysicalDeviceImageFormatProperties2(
++      chain->wsi->pdevice, &query, &properties);
++   if (result != VK_SUCCESS && result != VK_ERROR_FORMAT_NOT_SUPPORTED)
++      return result;
++   const VkImageFormatProperties *limits = &properties.imageFormatProperties;
++   if (result != VK_SUCCESS ||
++       info->create.extent.width > limits->maxExtent.width ||
++       info->create.extent.height > limits->maxExtent.height ||
++       !limits->maxMipLevels || !limits->maxArrayLayers ||
++       !(limits->sampleCounts & VK_SAMPLE_COUNT_1_BIT)) {
++      fprintf(stderr, "WSI_LINEAR_SHARED_MODE requested=1 active=0 reason=linear_usage_support result=%d\n", result);
++      return VK_SUCCESS;
++   }
++   VkImageCreateInfo probe_info = info->create;
++   probe_info.tiling = VK_IMAGE_TILING_LINEAR;
++   VkImage probe = VK_NULL_HANDLE;
++   result = chain->wsi->CreateImage(chain->device, &probe_info, &chain->alloc, &probe);
++   if (result == VK_ERROR_FORMAT_NOT_SUPPORTED || result == VK_ERROR_FEATURE_NOT_PRESENT) {
++      fprintf(stderr, "WSI_LINEAR_SHARED_MODE requested=1 active=0 reason=linear_image_create result=%d\n", result);
++      return VK_SUCCESS;
++   }
++   if (result != VK_SUCCESS)
++      return result;
++   VkMemoryRequirements reqs = {};
++   chain->wsi->GetImageMemoryRequirements(chain->device, probe, &reqs);
++   VkImageSubresource subresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
++   VkSubresourceLayout layout = {};
++   chain->wsi->GetImageSubresourceLayout(chain->device, probe, &subresource, &layout);
++   chain->wsi->DestroyImage(chain->device, probe, &chain->alloc);
++   uint64_t row_bytes = (uint64_t)info->create.extent.width * 4;
++   uint64_t height = info->create.extent.height;
++   bool layout_supported = reqs.size && reqs.size <= UINT32_MAX - 65535 &&
++      reqs.memoryTypeBits && layout.offset <= reqs.size &&
++      !(layout.offset % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT) &&
++      layout.rowPitch && layout.rowPitch <= UINT32_MAX &&
++      !(layout.rowPitch % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) &&
++      layout.rowPitch >= row_bytes && height &&
++      height <= (reqs.size - layout.offset) / layout.rowPitch &&
++      height <= layout.size / layout.rowPitch;
++   if (!layout_supported) {
++      fprintf(stderr, "WSI_LINEAR_SHARED_MODE requested=1 active=0 reason=linear_layout\n");
++      return VK_SUCCESS;
++   }
++   info->create.tiling = VK_IMAGE_TILING_LINEAR;
++   info->win32_linear_shared = true;
++   fprintf(stderr, "WSI_LINEAR_SHARED_MODE requested=1 active=1 reason=preflight_pass width=%u height=%u format=%u\n",
++           info->create.extent.width, info->create.extent.height, (unsigned)info->create.format);
++
+    return VK_SUCCESS;
+ }
+ 
+@@ -648,6 +1221,7 @@
+                      const VkAllocationCallbacks *allocator,
+                      struct wsi_win32_image *image)
+ {
++   image->chain = chain;
+    VkResult result = wsi_create_image(&chain->base, &chain->base.image_info,
+                                       &image->base);
+    if (result != VK_SUCCESS) {
+@@ -717,7 +1291,32 @@
+ static void
+ wsi_win32_finish_dxgi_image(struct wsi_win32_image *image)
+ {
+-   wsi_win32_wait_copy(image, UINT64_MAX);
++   if (wsi_win32_wait_copy(image, UINT64_MAX) == VK_SUCCESS)
++      wsi_win32_collect_copy_timing(image);
++   if(image->dxgi.profile) image->dxgi.profile->Collect(image);
++   wsi_win32_report_verify(image);
++   if (image->dxgi.acquire_fence && image->dxgi.event &&
++       image->dxgi.acquire_fence->GetCompletedValue() < image->base.win32_acquire_value) {
++      ResetEvent(image->dxgi.event);
++      if (SUCCEEDED(image->dxgi.acquire_fence->SetEventOnCompletion(image->base.win32_acquire_value, image->dxgi.event)))
++         WaitForSingleObject(image->dxgi.event, INFINITE);
++   }
++   if (image->base.win32_acquire_sync) {
++      image->chain->wsi->wsi->win32.destroy_native_sync(image->chain->base.device, image->base.win32_acquire_sync);
++      image->base.win32_acquire_sync = NULL;
++   }
++   if(image->dxgi.profile && image->dxgi.profile->enabled) image->dxgi.profile->Calibrate(image->chain,true);
++   delete image->dxgi.profile;
++   if (image->dxgi.acquire_fence) image->dxgi.acquire_fence->Release();
++   if (image->dxgi.acquire_list) image->dxgi.acquire_list->Release();
++   if (image->dxgi.acquire_allocator) image->dxgi.acquire_allocator->Release();
++   if (image->dxgi.rtv_heap) image->dxgi.rtv_heap->Release();
++   if (image->dxgi.verify_readback)
++      image->dxgi.verify_readback->Release();
++   if (image->dxgi.copy_query_readback)
++      image->dxgi.copy_query_readback->Release();
++   if (image->dxgi.copy_query_heap)
++      image->dxgi.copy_query_heap->Release();
+    if (image->dxgi.list)
+       image->dxgi.list->Release();
+    if (image->dxgi.allocator)
+@@ -756,6 +1355,8 @@
+    for (uint32_t i = 0; i < chain->base.image_count; i++)
+       wsi_win32_image_finish(chain, allocator, &chain->images[i]);
+ 
++   wsi_win32_report_copy_timing(chain);
++
+    DeleteDC(chain->chain_dc);
+ 
+    if (chain->surface->current_swapchain == chain) {
+@@ -764,6 +1365,9 @@
+       chain->surface->current_swapchain = NULL;
+    }
+ 
++   wsi_native_report_waits(chain, true);
++   if (chain->native_latency)
++      CloseHandle(chain->native_latency);
+    if (chain->dxgi)
+       chain->dxgi->Release();
+    while (chain->present_head) {
+@@ -800,6 +1404,8 @@
+       mtx_lock(&chain->acquire_mutex);
+ 
+    image->state = WSI_IMAGE_IDLE;
++   if (chain->base.image_info.win32_native_tiled && image->dxgi.native_prepared)
++      chain->native_latency_ready = true;
+ 
+    if (!chain->dxgi) {
+       u_cnd_monotonic_broadcast(&chain->acquire_cond);
+@@ -880,6 +1486,165 @@
+ }
+ 
+ static VkResult
++wsi_native_acquire(struct wsi_win32_swapchain *chain,
++                   const VkAcquireNextImageInfoKHR *info, uint32_t *image_index)
++{
++   uint64_t deadline = os_time_get_absolute_timeout(info->timeout);
++   if (chain->native_wait_stats) {
++      if (!chain->native_stats_start)
++         chain->native_stats_start = os_time_get_nano();
++      chain->native_acquires++;
++   }
++   uint32_t index = chain->dxgi->GetCurrentBackBufferIndex();
++   if (index >= chain->base.image_count)
++      return VK_ERROR_OUT_OF_DATE_KHR;
++   auto image = &chain->images[index];
++   if(image->dxgi.profile) image->dxgi.profile->Event(image,"native_acquire_begin");
++   if (image->state == WSI_IMAGE_DRAWING)
++      return info->timeout ? VK_TIMEOUT : VK_NOT_READY;
++   if (!chain->native_latency_ready) {
++      DWORD ms = info->timeout == UINT64_MAX ? INFINITE :
++         (DWORD)MIN2(info->timeout / 1000000, INFINITE - 1ULL);
++      uint64_t begin = chain->native_wait_stats ? os_time_get_nano() : 0;
++      if(image->dxgi.profile) image->dxgi.profile->Event(image,"admission_begin");
++      DWORD r = WaitForSingleObject(chain->native_latency, ms);
++      if(image->dxgi.profile) image->dxgi.profile->Event(image,"admission_end",r);
++      if (chain->native_wait_stats) {
++         uint64_t delta = os_time_get_nano() - begin;
++         chain->native_latency_ns += delta;
++         chain->native_latency_max = MAX2(chain->native_latency_max, delta);
++      }
++      if (r == WAIT_TIMEOUT)
++         return info->timeout ? VK_TIMEOUT : VK_NOT_READY;
++      if (r != WAIT_OBJECT_0)
++         return VK_ERROR_DEVICE_LOST;
++      chain->native_latency_ready = true;
++   }
++   uint64_t now = os_time_get_nano();
++   uint64_t remaining = deadline == UINT64_MAX ? UINT64_MAX :
++      deadline > now ? deadline - now : 0;
++   uint64_t begin = chain->native_wait_stats ? os_time_get_nano() : 0;
++   if(image->dxgi.profile) image->dxgi.profile->Event(image,"reuse_begin");
++   VkResult result = wsi_win32_wait_copy(image, remaining);
++   if(image->dxgi.profile) image->dxgi.profile->Event(image,"reuse_end",uint64_t(int64_t(result)));
++   if (chain->native_wait_stats) {
++      uint64_t delta = os_time_get_nano() - begin;
++      chain->native_reuse_ns += delta;
++      chain->native_reuse_max = MAX2(chain->native_reuse_max, delta);
++   }
++   if (result != VK_SUCCESS)
++      return result == VK_NOT_READY && info->timeout ? VK_TIMEOUT : result;
++   wsi_win32_collect_copy_timing(image);
++   if(image->dxgi.profile) image->dxgi.profile->Collect(image);
++   if (!image->dxgi.native_prepared) {
++      auto queue = (ID3D12CommandQueue *)chain->base.wsi->win32.get_d3d12_command_queue(chain->base.device);
++      if (!queue || FAILED(image->dxgi.acquire_allocator->Reset()) ||
++          FAILED(image->dxgi.acquire_list->Reset(image->dxgi.acquire_allocator, NULL)))
++         return VK_ERROR_DEVICE_LOST;
++      D3D12_RESOURCE_BARRIER barrier = {};
++      barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++      barrier.Transition.pResource = image->dxgi.swapchain_res;
++      barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++      barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
++      barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
++      if(image->dxgi.profile) image->dxgi.profile->Mark(image->dxgi.acquire_list,0);
++      image->dxgi.acquire_list->ResourceBarrier(1, &barrier);
++      if (!image->dxgi.native_initialized) {
++         const float clear[4] = {0, 0, 0, 1};
++         image->dxgi.acquire_list->ClearRenderTargetView(
++            image->dxgi.rtv_heap->GetCPUDescriptorHandleForHeapStart(), clear, 0, NULL);
++      }
++      if(image->dxgi.profile) {
++         image->dxgi.profile->Mark(image->dxgi.acquire_list,1);
++         image->dxgi.profile->Resolve(image->dxgi.acquire_list,0);
++         image->dxgi.profile->acquire_cpu=GpuProfile::Qpc();
++      }
++      if (FAILED(image->dxgi.acquire_list->Close()))
++         return VK_ERROR_DEVICE_LOST;
++      ID3D12CommandList *list = image->dxgi.acquire_list;
++      queue->ExecuteCommandLists(1, &list);
++      uint64_t value = image->base.win32_acquire_value + 1;
++      if (!value || FAILED(queue->Signal(image->dxgi.acquire_fence, value)))
++         return VK_ERROR_DEVICE_LOST;
++      image->base.win32_acquire_value = value;
++      image->dxgi.native_prepared = true;
++      image->dxgi.native_initialized = true;
++   }
++   chain->native_latency_ready = false;
++   image->state = WSI_IMAGE_DRAWING;
++   *image_index = index;
++   if(image->dxgi.profile) image->dxgi.profile->Event(image,"native_acquire_end",image->base.win32_acquire_value);
++   if (wsi_win32_option_enabled("TU_WDDM_WSI_TRACE"))
++      fprintf(stderr, "WSI_NATIVE_ACQUIRE image=%u value=%llu completed=%llu\n", index,
++         (unsigned long long)image->base.win32_acquire_value,
++         (unsigned long long)image->dxgi.acquire_fence->GetCompletedValue());
++   return VK_SUCCESS;
++}
++
++static VkResult
++wsi_native_present(struct wsi_win32_swapchain *chain, struct wsi_win32_image *image)
++{
++   const auto wsi = chain->base.wsi;
++   uint32_t index = image - chain->images;
++   if (chain->dxgi->GetCurrentBackBufferIndex() != index || !image->dxgi.native_prepared)
++      return VK_ERROR_OUT_OF_DATE_KHR;
++   auto queue = (ID3D12CommandQueue *)wsi->win32.get_d3d12_command_queue(chain->base.device);
++   uint64_t value = 0;
++   auto ready = (ID3D12Fence *)wsi->win32.get_d3d12_fence(chain->base.device, chain->base.fences[index], &value);
++   if (!queue || !ready || !value || FAILED(image->dxgi.allocator->Reset()) ||
++       FAILED(image->dxgi.list->Reset(image->dxgi.allocator, NULL)))
++      return VK_ERROR_DEVICE_LOST;
++   bool verify = image->dxgi.verify_readback && image->dxgi.verify_submitted < WSI_WIN32_VERIFY_MAX_SAMPLES;
++   D3D12_RESOURCE_BARRIER barrier = {};
++   barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++   barrier.Transition.pResource = image->dxgi.swapchain_res;
++   barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++   barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++   barrier.Transition.StateAfter = verify ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_PRESENT;
++   if(image->dxgi.profile) image->dxgi.profile->Mark(image->dxgi.list,2);
++   image->dxgi.list->ResourceBarrier(1, &barrier);
++   if (verify) {
++      D3D12_TEXTURE_COPY_LOCATION src = {};
++      src.pResource = image->dxgi.swapchain_res;
++      src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++      D3D12_TEXTURE_COPY_LOCATION dst = {};
++      dst.pResource = image->dxgi.verify_readback;
++      dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++      dst.PlacedFootprint = image->dxgi.verify_footprint;
++      image->dxgi.list->CopyTextureRegion(&dst, 0, 0, 0, &src, NULL);
++      barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
++      barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
++      image->dxgi.list->ResourceBarrier(1, &barrier);
++   }
++   if(image->dxgi.profile) {
++      image->dxgi.profile->Mark(image->dxgi.list,3);
++      image->dxgi.profile->Resolve(image->dxgi.list,2);
++      image->dxgi.profile->present_cpu=GpuProfile::Qpc();
++   }
++   if (FAILED(image->dxgi.list->Close())) return VK_ERROR_DEVICE_LOST;
++   if(image->dxgi.profile) image->dxgi.profile->Event(image,"queue_wait_api_begin",value,ready->GetCompletedValue());
++   HRESULT wait_hr=queue->Wait(ready,value);
++   if(image->dxgi.profile) image->dxgi.profile->Event(image,"queue_wait_api_end",value,(uint64_t)wait_hr);
++   if(FAILED(wait_hr)) return VK_ERROR_DEVICE_LOST;
++   ID3D12CommandList *list = image->dxgi.list;
++   queue->ExecuteCommandLists(1, &list);
++   uint64_t serial = image->dxgi.serial + 1;
++   if (!serial || FAILED(queue->Signal(image->dxgi.complete, serial)))
++      return VK_ERROR_DEVICE_LOST;
++   image->dxgi.serial = serial;
++   if(image->dxgi.profile) image->dxgi.profile->Event(image,"native_present_submitted",value,serial);
++   image->dxgi.native_prepared = false;
++   if (verify) {
++      image->dxgi.verify_submitted++;
++      image->dxgi.verify_pending_serial = serial;
++   }
++   if (wsi_win32_option_enabled("TU_WDDM_WSI_TRACE"))
++      fprintf(stderr, "WSI_NATIVE_PRESENT image=%u serial=%llu render_value=%llu output_copies=0\n",
++         index, (unsigned long long)serial, (unsigned long long)value);
++   return VK_SUCCESS;
++}
++
++static VkResult
+ wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
+                              const VkAcquireNextImageInfoKHR *info,
+                              uint32_t *image_index)
+@@ -896,6 +1661,14 @@
+    if (!chain->dxgi)
+       return wsi_win32_acquire_idle_cpu_image(chain, info, image_index);
+ 
++   if (chain->base.image_info.win32_native_tiled) {
++      mtx_lock(&chain->acquire_mutex);
++      VkResult result = wsi_native_acquire(chain, info, image_index);
++      if (result < 0) p_atomic_set(&chain->status, result);
++      mtx_unlock(&chain->acquire_mutex);
++      return result;
++   }
++
+    if (chain->base.blit.type == WSI_SWAPCHAIN_BUFFER_BLIT) {
+       uint32_t selected = UINT32_MAX;
+       for (uint32_t i = 0; i < chain->base.image_count; i++) {
+@@ -903,6 +1676,7 @@
+             continue;
+          VkResult result = wsi_win32_wait_copy(&chain->images[i], 0);
+          if (result == VK_SUCCESS) {
++            wsi_win32_collect_copy_timing(&chain->images[i]);
+             chain->images[i].state = WSI_IMAGE_DRAWING;
+             *image_index = i;
+             return VK_SUCCESS;
+@@ -917,6 +1691,7 @@
+       VkResult result = wsi_win32_wait_copy(&chain->images[selected], info->timeout);
+       if (result != VK_SUCCESS)
+          return result;
++      wsi_win32_collect_copy_timing(&chain->images[selected]);
+       chain->images[selected].state = WSI_IMAGE_DRAWING;
+       *image_index = selected;
+       return VK_SUCCESS;
+@@ -1075,13 +1850,35 @@
+    D3D12_TEXTURE_COPY_LOCATION src = {};
+    src.pResource = image->dxgi.buffer;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++   src.PlacedFootprint.Offset = image->base.offsets[0];
+    src.PlacedFootprint.Footprint.Format = destination->GetDesc().Format;
+    src.PlacedFootprint.Footprint.Width = chain->extent.width;
+    src.PlacedFootprint.Footprint.Height = chain->extent.height;
+    src.PlacedFootprint.Footprint.Depth = 1;
+    src.PlacedFootprint.Footprint.RowPitch = image->base.row_pitches[0];
++   if (image->dxgi.copy_query_heap)
++      image->dxgi.list->EndQuery(image->dxgi.copy_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    image->dxgi.list->CopyTextureRegion(&dst, 0, 0, 0, &src, NULL);
+-   barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++   if (image->dxgi.copy_query_heap) {
++      image->dxgi.list->EndQuery(image->dxgi.copy_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
++      image->dxgi.list->ResolveQueryData(image->dxgi.copy_query_heap,
++                                          D3D12_QUERY_TYPE_TIMESTAMP, 0, 2,
++                                          image->dxgi.copy_query_readback, 0);
++   }
++   bool verify = image->dxgi.verify_readback &&
++                 image->dxgi.verify_submitted < WSI_WIN32_VERIFY_MAX_SAMPLES;
++   if (verify) {
++      barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++      barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++      image->dxgi.list->ResourceBarrier(1, &barrier);
++      D3D12_TEXTURE_COPY_LOCATION readback = {};
++      readback.pResource = image->dxgi.verify_readback;
++      readback.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++      readback.PlacedFootprint = image->dxgi.verify_footprint;
++      image->dxgi.list->CopyTextureRegion(&readback, 0, 0, 0, &dst, NULL);
++   }
++   barrier.Transition.StateBefore = verify ? D3D12_RESOURCE_STATE_COPY_SOURCE :
++                                            D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    image->dxgi.list->ResourceBarrier(1, &barrier);
+    if (FAILED(image->dxgi.list->Close()) || FAILED(queue->Wait(ready, ready_value)))
+@@ -1092,6 +1889,10 @@
+    if (FAILED(queue->Signal(image->dxgi.complete, serial)))
+       return VK_ERROR_DEVICE_LOST;
+    image->dxgi.serial = serial;
++   if (verify) {
++      image->dxgi.verify_submitted++;
++      image->dxgi.verify_pending_serial = serial;
++   }
+    return VK_SUCCESS;
+ }
+ 
+@@ -1101,6 +1902,11 @@
+                              uint64_t present_id,
+                              const VkPresentRegionKHR *damage)
+ {
++   if (chain->base.image_info.win32_native_tiled) {
++      VkResult result = wsi_native_present(chain, image);
++      if (result != VK_SUCCESS)
++         return result;
++   }
+    if (image->dxgi.buffer) {
+       VkResult result = wsi_win32_copy_to_dxgi(chain, image);
+       if (result != VK_SUCCESS)
+@@ -1150,8 +1956,23 @@
+       VK_SYSTEM_ALLOCATION_SCOPE_OBJECT) : NULL;
+    if (needs_record && !record)
+       return VK_ERROR_OUT_OF_HOST_MEMORY;
++   if(image->dxgi.profile) image->dxgi.profile->Event(image,"dxgi_mutex_begin");
+    mtx_lock(&chain->acquire_mutex);
++   if(image->dxgi.profile) image->dxgi.profile->Event(image,"dxgi_mutex_end");
++   uint64_t present_begin = chain->native_wait_stats ? os_time_get_nano() : 0;
++   if(image->dxgi.profile) image->dxgi.profile->Event(image,"present1_begin",sync_interval,present_flags);
+    HRESULT hres = chain->dxgi->Present1(sync_interval, present_flags, &params);
++   if(image->dxgi.profile) {
++      image->dxgi.profile->Event(image,"present1_end",uint64_t(hres));
++      image->dxgi.profile->DisplayStats(image,hres,sync_interval,present_flags);
++   }
++   if (chain->native_wait_stats) {
++      uint64_t delta = os_time_get_nano() - present_begin;
++      chain->native_present_ns += delta;
++      chain->native_present_max = MAX2(chain->native_present_max, delta);
++      chain->native_presents++;
++      wsi_native_report_waits(chain, false);
++   }
+    if (SUCCEEDED(hres) && hres != DXGI_STATUS_OCCLUDED && record) {
+       hres = chain->dxgi->GetLastPresentCount(&record->count);
+       if (SUCCEEDED(hres)) {
+@@ -1290,6 +2111,11 @@
+ 
+    const VkImageUsageFlags2KHR image_usage = vk_swapchain_usage_flags(create_info);
+ 
++   if (chain->base.image_info.win32_native_tiled) {
++      desc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
++      desc.BufferUsage |= DXGI_USAGE_RENDER_TARGET_OUTPUT;
++   }
++
+    if (image_usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))
+       desc.BufferUsage |= DXGI_USAGE_SHADER_INPUT;
+ 
+@@ -1304,6 +2130,24 @@
+    if (FAILED(query_result))
+       return VK_ERROR_INITIALIZATION_FAILED;
+ 
++   if (chain->base.image_info.win32_native_tiled) {
++      const char *option = getenv("TU_WSI_NATIVE_MAX_LATENCY");
++      if (option && strcmp(option, "1") && strcmp(option, "2"))
++         return VK_ERROR_INITIALIZATION_FAILED;
++      chain->native_max_latency = option && !strcmp(option, "1") ? 1 : 2;
++      chain->native_wait_stats = wsi_win32_option_enabled("TU_WSI_NATIVE_WAIT_STATS");
++      if (FAILED(chain->dxgi->SetMaximumFrameLatency(chain->native_max_latency)))
++         return VK_ERROR_INITIALIZATION_FAILED;
++      UINT actual = 0;
++      if (FAILED(chain->dxgi->GetMaximumFrameLatency(&actual)) || actual != chain->native_max_latency)
++         return VK_ERROR_INITIALIZATION_FAILED;
++      fprintf(stderr, "WSI_NATIVE_POLICY revision=2 buffers=%u requested_latency=%u actual_latency=%u wait_stats=%u\n",
++         create_info->minImageCount, chain->native_max_latency, actual, (unsigned)chain->native_wait_stats);
++      chain->native_latency = chain->dxgi->GetFrameLatencyWaitableObject();
++      if (!chain->native_latency)
++         return VK_ERROR_INITIALIZATION_FAILED;
++   }
++
+    if (!surface->target &&
+        FAILED(wsi->dxgi.dcomp->CreateTargetForHwnd(surface->base.hwnd, false, &surface->target)))
+       return VK_ERROR_INITIALIZATION_FAILED;
+@@ -1364,6 +2208,20 @@
+       { WSI_IMAGE_TYPE_DXGI },
+    };
+    dxgi_image_params.storage_image = (image_usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
++   const bool native_requested = wsi_win32_option_enabled("TU_WSI_NATIVE_TILED");
++   dxgi_image_params.native_tiled = native_requested &&
++      wsi_device->win32.import_native_image && wsi_device->win32.create_native_sync &&
++      !create_info->flags && create_info->imageArrayLayers == 1 &&
++      create_info->minImageCount == 2 && create_info->imageSharingMode == VK_SHARING_MODE_EXCLUSIVE &&
++      create_info->imageFormat == VK_FORMAT_B8G8R8A8_UNORM &&
++      create_info->imageExtent.width >= 16 && create_info->imageExtent.width <= 4096 &&
++      create_info->imageExtent.height && create_info->imageExtent.height <= 4096 &&
++      (uint64_t)create_info->imageExtent.width * create_info->imageExtent.height * 4 <= 56 * 1024 * 1024 &&
++      !(image_usage & ~(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)) &&
++      !vk_find_struct_const(create_info->pNext, IMAGE_COMPRESSION_CONTROL_EXT);
++   if (native_requested && !dxgi_image_params.native_tiled)
++      fprintf(stderr, "WSI_NATIVE_MODE requested=1 active=0 reason=unsupported_configuration format=%u\n", (unsigned)create_info->imageFormat);
+ 
+    struct wsi_cpu_image_params cpu_image_params = {
+       { WSI_IMAGE_TYPE_CPU },
+@@ -1372,6 +2230,14 @@
+    bool supports_dxgi = wsi->dxgi.factory &&
+                         wsi->dxgi.dcomp &&
+                         wsi->wsi->win32.get_d3d12_command_queue;
++   if (wsi_win32_option_enabled("TU_WSI_VERIFY") &&
++       (!supports_dxgi || !wsi_device->win32.create_buffer_memory)) {
++      fprintf(stderr, "WSI_PROTOTYPE_REJECT reason=dxgi_buffer_backend_required\n");
++      u_cnd_monotonic_destroy(&chain->acquire_cond);
++      mtx_destroy(&chain->acquire_mutex);
++      vk_free(allocator, chain);
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++   }
+    struct wsi_base_image_params *image_params = supports_dxgi ?
+       &dxgi_image_params.base : &cpu_image_params.base;
+ 
+@@ -1412,6 +2278,21 @@
+          goto fail;
+    }
+ 
++   {
++      const char *timing = getenv("TU_WSI_COPY_TIMING");
++      chain->copy_timing_requested = timing && !strcmp(timing, "1");
++      chain->copy_timing_full = wsi_win32_option_enabled("TU_WSI_TIMING_FULL");
++      chain->verify_requested = wsi_win32_option_enabled("TU_WSI_VERIFY");
++      if (chain->copy_timing_requested && supports_dxgi &&
++          chain->base.blit.type == WSI_SWAPCHAIN_BUFFER_BLIT &&
++          !(create_info->flags & VK_SWAPCHAIN_CREATE_PROTECTED_BIT_KHR)) {
++         chain->copy_timing_samples = (wsi_win32_copy_timing_sample *)
++            calloc(WSI_WIN32_COPY_TIMING_MAX_SAMPLES, sizeof(*chain->copy_timing_samples));
++         if (!chain->copy_timing_samples)
++            chain->copy_timing_vk_error = VK_ERROR_OUT_OF_HOST_MEMORY;
++      }
++   }
++
+    for (uint32_t image = 0; image < num_images; image++) {
+       result = wsi_win32_image_init(device, chain,
+                                     create_info, allocator,
+--- /dev/null
++++ b/src/vulkan/wsi/gpu_profile.hpp
+@@ -0,0 +1,114 @@
++#pragma once
++#include <vulkan/vulkan.h>
++#include <windows.h>
++#include <array>
++#include <cstdio>
++#include <cstdint>
++#include <cstring>
++#include <string>
++
++namespace GpuProfile {
++inline bool Enabled() {
++    static bool enabled = [] { wchar_t s[8]{}; return GetEnvironmentVariableW(L"SNAPRYU_GPU_PROFILE", s, 8) == 1 && s[0] == L'1'; }();
++    return enabled;
++}
++inline uint64_t Qpc() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
++inline uint64_t Frequency() { LARGE_INTEGER v; QueryPerformanceFrequency(&v); return v.QuadPart; }
++inline FILE* Open(const wchar_t* name) {
++    wchar_t path[32768]{};
++    auto n = GetEnvironmentVariableW(L"SNAPRYU_GPU_PROFILE_DIR", path, 32768);
++    if (!n || n >= 32768) return nullptr;
++    std::wstring file(path); file += L"\\"; file += name;
++    FILE* f = _wfopen(file.c_str(), L"ab");
++    if (f) setvbuf(f, nullptr, _IOFBF, 65536);
++    return f;
++}
++class Timer {
++public:
++    static constexpr uint32_t Slots = 256;
++    VkDevice device{};
++    VkQueryPool pool{};
++    PFN_vkDestroyQueryPool destroy{};
++    PFN_vkCmdResetQueryPool reset{};
++    PFN_vkCmdWriteTimestamp stamp{};
++    PFN_vkGetQueryPoolResults results{};
++    FILE* file{};
++    uint64_t epoch{}, mask{}, frequency{}, report{}, serial{}, skipped{}, errors{};
++    float period{};
++    uint32_t head{}, count{}, active{Slots};
++    bool poisoned{};
++    const char* kind{};
++    struct Item { uint64_t completion{}, id{}, cpu_qpc{}; uint32_t slot{}, passes{}; };
++    std::array<Item, Slots> pending{};
++    void Init(VkDevice d, PFN_vkGetDeviceProcAddr get, float ns, uint32_t bits,
++              const wchar_t* filename, const char* label) {
++        if (!Enabled() || !bits || ns <= 0) return;
++        device=d; kind=label; period=ns; mask=bits>=64 ? ~uint64_t(0) : ((uint64_t(1)<<bits)-1);
++        auto create = reinterpret_cast<PFN_vkCreateQueryPool>(get(d,"vkCreateQueryPool"));
++        destroy=reinterpret_cast<PFN_vkDestroyQueryPool>(get(d,"vkDestroyQueryPool"));
++        reset=reinterpret_cast<PFN_vkCmdResetQueryPool>(get(d,"vkCmdResetQueryPool"));
++        stamp=reinterpret_cast<PFN_vkCmdWriteTimestamp>(get(d,"vkCmdWriteTimestamp"));
++        results=reinterpret_cast<PFN_vkGetQueryPoolResults>(get(d,"vkGetQueryPoolResults"));
++        if (!create || !destroy || !reset || !stamp || !results) return;
++        file=Open(filename);
++        if (!file) return;
++        VkQueryPoolCreateInfo ci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
++        ci.queryType=VK_QUERY_TYPE_TIMESTAMP;ci.queryCount=Slots*4;
++        auto r=create(d,&ci,nullptr,&pool);
++        frequency=Frequency();report=Qpc();epoch=report;
++        fprintf(file,"META kind=%s pool_result=%d period_ns=%.9f valid_bits=%u qpc_hz=%llu slots=%u scope=elapsed_gpu_span_not_exclusive_busy extra_submit=0 extra_wait=0\n",kind,int(r),period,bits,(unsigned long long)frequency,Slots);
++        fflush(file);
++    }
++    bool Begin(VkCommandBuffer cmd, uint64_t completed) {
++        if (!pool || poisoned) return false;
++        Collect(completed);
++        if (count==Slots) { ++skipped; active=Slots; return false; }
++        active=(head+count)%Slots;
++        reset(cmd,pool,active*4,4);
++        stamp(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,pool,active*4);
++        return true;
++    }
++    void Mark(VkCommandBuffer cmd, uint32_t offset, VkPipelineStageFlagBits stage) {
++        if (pool && active<Slots) stamp(cmd,stage,pool,active*4+offset);
++    }
++    void Submitted(uint64_t completion, uint32_t passes=0) {
++        if (active==Slots) return;
++        pending[(head+count)%Slots]={completion,++serial,Qpc(),active,passes};
++        ++count;active=Slots;
++    }
++    void Failed() { active=Slots; poisoned=true; }
++    void Collect(uint64_t completed) {
++        while (pool && count && pending[head].completion<=completed) {
++            const auto e=pending[head];
++            std::array<uint64_t,8> data{};
++            auto r=results(device,pool,e.slot*4,4,sizeof(data),data.data(),sizeof(uint64_t)*2,
++                           VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
++            if (r!=VK_SUCCESS || !data[1] || !data[3] || !data[5] || !data[7]) {
++                ++errors; fprintf(file,"QUERY_ERROR kind=%s id=%llu result=%d completed=%llu\n",kind,(unsigned long long)e.id,int(r),(unsigned long long)completed);
++                poisoned=true; break;
++            }
++            auto us=[&](int a,int b){
++                uint64_t delta=(data[b*2]-data[a*2])&mask;
++                double ticks=delta>mask/2 ? -double((data[a*2]-data[b*2])&mask) : double(delta);
++                return ticks*period/1000.;
++            };
++            fprintf(file,"S kind=%s epoch=%llu id=%llu completion=%llu cpu_submit_qpc=%llu passes=%u t0=%llu t1=%llu t2=%llu t3=%llu span_us=%.3f a_us=%.3f b_us=%.3f c_us=%.3f\n",kind,(unsigned long long)epoch,(unsigned long long)e.id,(unsigned long long)e.completion,(unsigned long long)e.cpu_qpc,e.passes,(unsigned long long)data[0],(unsigned long long)data[2],(unsigned long long)data[4],(unsigned long long)data[6],us(0,3),us(0,1),us(1,2),us(2,3));
++            head=(head+1)%Slots;--count;
++        }
++        const auto now=Qpc();
++        if(file && now-report>=frequency*5) {
++            fprintf(file,"STATUS kind=%s submitted=%llu pending=%u skipped=%llu errors=%llu qpc=%llu\n",kind,(unsigned long long)serial,count,(unsigned long long)skipped,(unsigned long long)errors,(unsigned long long)now);
++            fflush(file);report=now;
++        }
++    }
++    void Close(bool completed) {
++        if (completed) Collect(~uint64_t(0));
++        if (file) {
++            fprintf(file,"END kind=%s submitted=%llu pending=%u skipped=%llu errors=%llu\n",kind,(unsigned long long)serial,count,(unsigned long long)skipped,(unsigned long long)errors);
++            fclose(file); file=nullptr;
++        }
++        if(pool && completed) destroy(device,pool,nullptr);
++        pool=VK_NULL_HANDLE;
++    }
++};
++}
+--- /dev/null
++++ b/src/vulkan/wsi/native_gpu_profile.inc
+@@ -0,0 +1,88 @@
++struct NativeGpuProfile {
++   ID3D12QueryHeap *heap = nullptr;
++   ID3D12Resource *readback = nullptr;
++   ID3D12CommandQueue *queue = nullptr;
++   FILE *file = nullptr;
++   uint64_t frequency = 0, collected = 0, calibration_qpc = 0;
++   uint64_t acquire_cpu = 0, present_cpu = 0;
++   uint64_t samples = 0, errors = 0;
++   bool enabled = false;
++
++   void Event(struct wsi_win32_image *image, const char *event, uint64_t a=0, uint64_t b=0, uint64_t c=0) {
++      if(file) fprintf(file,"C event=%s qpc=%llu chain=%p image=%u vk_image=%llu serial=%llu a=%llu b=%llu c=%llu\n",event,(unsigned long long)GpuProfile::Qpc(),(void*)image->chain,(unsigned)(image-image->chain->images),(unsigned long long)image->base.image,(unsigned long long)image->dxgi.serial,(unsigned long long)a,(unsigned long long)b,(unsigned long long)c);
++   }
++   void DisplayStats(struct wsi_win32_image *image, HRESULT present_hr, UINT interval, UINT flags) {
++      if(!file) return;
++      DXGI_FRAME_STATISTICS stats={}; UINT last=0;
++      uint64_t before=GpuProfile::Qpc();
++      HRESULT sh=image->chain->dxgi->GetFrameStatistics(&stats);
++      HRESULT lh=image->chain->dxgi->GetLastPresentCount(&last);
++      fprintf(file,"DISPLAY chain=%p image=%u vk_image=%llu serial=%llu qpc=%llu before_qpc=%llu present_hr=%lx stats_hr=%lx last_hr=%lx last_count=%u displayed_count=%u present_refresh=%u sync_refresh=%u sync_qpc=%llu sync_gpu=%llu interval=%u flags=%u source=dxgi_statistics_not_optical_scanout\n",(void*)image->chain,(unsigned)(image-image->chain->images),(unsigned long long)image->base.image,(unsigned long long)image->dxgi.serial,(unsigned long long)GpuProfile::Qpc(),(unsigned long long)before,(unsigned long)present_hr,(unsigned long)sh,(unsigned long)lh,last,stats.PresentCount,stats.PresentRefreshCount,stats.SyncRefreshCount,(unsigned long long)stats.SyncQPCTime.QuadPart,(unsigned long long)stats.SyncGPUTime.QuadPart,interval,flags);
++   }
++   bool Init(ID3D12Device *device, ID3D12CommandQueue *q) {
++      queue = q;
++      wchar_t name[96];
++      swprintf(name,96,L"dxgi-gpu-%p.txt",(void *)this);
++      file=GpuProfile::Open(name);
++      if (!file || FAILED(queue->GetTimestampFrequency(&frequency)) || !frequency) return false;
++      D3D12_QUERY_HEAP_DESC query = {};
++      query.Type=D3D12_QUERY_HEAP_TYPE_TIMESTAMP;query.Count=4;
++      HRESULT hr=device->CreateQueryHeap(&query,IID_PPV_ARGS(&heap));
++      D3D12_HEAP_PROPERTIES props={};props.Type=D3D12_HEAP_TYPE_READBACK;
++      props.CreationNodeMask=props.VisibleNodeMask=1;
++      D3D12_RESOURCE_DESC desc={};desc.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;
++      desc.Width=32;desc.Height=desc.DepthOrArraySize=desc.MipLevels=1;
++      desc.SampleDesc.Count=1;desc.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++      if(SUCCEEDED(hr)) hr=device->CreateCommittedResource(&props,D3D12_HEAP_FLAG_NONE,&desc,
++         D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&readback));
++      enabled=SUCCEEDED(hr);
++      fprintf(file,"META kind=dxgi_native enabled=%u hr=%lx d3d_hz=%llu qpc_hz=%llu pixel_readback=0 extra_submit=0 extra_wait=0\n",enabled,(unsigned long)hr,(unsigned long long)frequency,(unsigned long long)GpuProfile::Frequency());
++      fflush(file);
++      return enabled;
++   }
++   void Mark(ID3D12GraphicsCommandList *list, UINT index) {
++      if(enabled) list->EndQuery(heap,D3D12_QUERY_TYPE_TIMESTAMP,index);
++   }
++   void Resolve(ID3D12GraphicsCommandList *list, UINT first) {
++      if(enabled) list->ResolveQueryData(heap,D3D12_QUERY_TYPE_TIMESTAMP,first,2,readback,first*8);
++   }
++   void Calibrate(struct wsi_win32_swapchain *chain, bool final=false) {
++      const uint64_t now=GpuProfile::Qpc();
++      if(!final && calibration_qpc && now-calibration_qpc<GpuProfile::Frequency()*5) return;
++      calibration_qpc=now;
++      uint64_t dg=0,dc=0;
++      uint64_t before=GpuProfile::Qpc();
++      HRESULT hr=queue->GetClockCalibration(&dg,&dc);
++      uint64_t after=GpuProfile::Qpc();
++      fprintf(file,"CAL_D3D hr=%lx gpu=%llu cpu_qpc=%llu before_qpc=%llu after_qpc=%llu\n",(unsigned long)hr,(unsigned long long)dg,(unsigned long long)dc,(unsigned long long)before,(unsigned long long)after);
++      auto wsi=chain->base.wsi;
++      if(final && wsi->GetCalibratedTimestampsKHR) {
++         VkCalibratedTimestampInfoKHR info[2]={};
++         for(unsigned i=0;i<2;++i) info[i].sType=VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR;
++         info[0].timeDomain=VK_TIME_DOMAIN_DEVICE_KHR;
++         info[1].timeDomain=VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR;
++         uint64_t values[2]={},deviation=0;
++         before=GpuProfile::Qpc();
++         VkResult result=wsi->GetCalibratedTimestampsKHR(chain->base.device,2,info,values,&deviation);
++         after=GpuProfile::Qpc();
++         fprintf(file,"CAL_VK phase=teardown_or_recreate added_submit_and_wait=1 result=%d gpu=%llu cpu_qpc=%llu deviation_ns=%llu period_ns=%.9f valid_bits=%u before_qpc=%llu after_qpc=%llu\n",result,(unsigned long long)values[0],(unsigned long long)values[1],(unsigned long long)deviation,(double)wsi->timestamp_period,wsi->timestamp_bits,(unsigned long long)before,(unsigned long long)after);
++      }
++      fflush(file);
++   }
++   void Collect(struct wsi_win32_image *image) {
++      if(!enabled || !image->dxgi.serial || collected==image->dxgi.serial) return;
++      if(image->dxgi.complete->GetCompletedValue()<image->dxgi.serial) return;
++      uint64_t data[4]={};void *mapped=nullptr;D3D12_RANGE range={0,32};
++      HRESULT hr=readback->Map(0,&range,&mapped);
++      if(FAILED(hr)) {++errors;return;}
++      memcpy(data,mapped,32);D3D12_RANGE none={0,0};readback->Unmap(0,&none);
++      collected=image->dxgi.serial;++samples;
++      fprintf(file,"S kind=dxgi_native vk_image=%llu chain=%p image=%u serial=%llu width=%u height=%u acquire_cpu_qpc=%llu present_cpu_qpc=%llu t0=%llu t1=%llu t2=%llu t3=%llu acquire_us=%.3f present_us=%.3f\n",(unsigned long long)image->base.image,(void *)image->chain,(unsigned)(image-image->chain->images),(unsigned long long)collected,image->chain->base.image_info.create.extent.width,image->chain->base.image_info.create.extent.height,(unsigned long long)acquire_cpu,(unsigned long long)present_cpu,(unsigned long long)data[0],(unsigned long long)data[1],(unsigned long long)data[2],(unsigned long long)data[3],double(data[1]-data[0])*1e6/frequency,double(data[3]-data[2])*1e6/frequency);
++      Calibrate(image->chain);
++   }
++   ~NativeGpuProfile() {
++      if(file){fprintf(file,"END samples=%llu errors=%llu\n",(unsigned long long)samples,(unsigned long long)errors);fclose(file);}
++      if(readback) readback->Release();
++      if(heap) heap->Release();
++   }
++};

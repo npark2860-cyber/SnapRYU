@@ -1,0 +1,4 @@
+#pragma once
+namespace CemuPad::Control::Detail {
+inline constexpr const char* SchemaText=R"CEMUPAD_SCHEMA(@CEMUPAD_CONTROL_SCHEMA@)CEMUPAD_SCHEMA";
+}

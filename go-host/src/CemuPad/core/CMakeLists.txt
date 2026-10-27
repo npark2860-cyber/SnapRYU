@@ -1,0 +1,10 @@
+add_library(CemuPadCore STATIC
+    WireCodec.cpp SessionCore.cpp MotionGate.cpp HapticLease.cpp ControlFramer.cpp VpadBridge.cpp)
+set_target_properties(CemuPadCore PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(CemuPadCore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../..)
+target_compile_features(CemuPadCore PUBLIC cxx_std_20)
+if(MSVC)
+    target_compile_options(CemuPadCore PRIVATE /W4 /permissive- /utf-8)
+else()
+    target_compile_options(CemuPadCore PRIVATE -Wall -Wextra -Wpedantic)
+endif()

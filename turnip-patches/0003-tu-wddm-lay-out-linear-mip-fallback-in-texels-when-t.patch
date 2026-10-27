@@ -1,0 +1,39 @@
+From 2d0ae89a6c2a872a5ee1aeef33ec5b05e8abb7ad Mon Sep 17 00:00:00 2001
+From: SnapRYU <snapryu@users.noreply.invalid>
+Date: Sat, 24 Oct 2026 17:33:47 +0000
+Subject: [PATCH 3/6] tu/wddm: lay out linear mip fallback in texels when the
+ kernel owns magic regs
+
+With kernel_sets_magic_regs Turnip does not program TPL1_DBG_ECO_CNTL, and the
+value the Windows driver uses leaves LINEAR_MIPMAP_FALLBACK_IN_BLOCKS clear, so
+the sampler compares the linear mipmap fallback threshold in texels. Turnip
+laid images out with the threshold in blocks, so small BCn mip levels were
+sampled with the wrong tiling (cyan/black distant grass in Age of Calamity).
+---
+ src/freedreno/vulkan/tu_device.cc | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 9be64053797..c046cc3008c 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -1745,6 +1745,16 @@ tu_physical_device_init(struct tu_physical_device *device,
+       device->dev_info = info;
+       device->info = &device->dev_info;
+ 
++      /* When the kernel owns the magic registers we never write
++       * TPL1_DBG_ECO_CNTL. The Qualcomm value (0x11100000 in raw_magic_regs)
++       * leaves LINEAR_MIPMAP_FALLBACK_IN_BLOCKS clear, so the hardware
++       * compares the linear mipmap fallback threshold in texels.
++       * Lay images out the same way, or compressed mip levels between the
++       * texel and block thresholds are sampled with the wrong tiling.
++       */
++      if (device->kernel_sets_magic_regs)
++         device->dev_info.props.supports_linear_mipmap_threshold_in_blocks = false;
++
+       device->usable_gmem_size_gmem =
+          fd6_calc_gmem_cache_offsets(&info, device->gmem_size,
+                                      &device->config_gmem,
+-- 
+2.43.0
+

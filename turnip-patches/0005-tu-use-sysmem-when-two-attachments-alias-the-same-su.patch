@@ -1,0 +1,73 @@
+From 4ce1fc0dac264eb62ecda51145d02e40ccafa63f Mon Sep 17 00:00:00 2001
+From: SnapRYU <snapryu@users.noreply.invalid>
+Date: Sat, 24 Oct 2026 17:33:47 +0000
+Subject: [PATCH 5/6] tu: use sysmem when two attachments alias the same
+ subresource
+
+When two attachments of a pass view the same image, mip and overlapping
+layers, GMEM keeps a separate tile copy per attachment and resolves both, so
+the copy stored last overwrites what was drawn through the other one.
+Rendering in sysmem writes the shared memory directly.
+
+Seen as a yellow ghost silhouette in The Legend of Zelda: Breath of the Wild
+under the Eden/yuzu-family emulators, which bind one image to two color
+slots without VK_ATTACHMENT_DESCRIPTION_MAY_ALIAS_BIT.
+---
+ src/freedreno/vulkan/tu_cmd_buffer.cc | 34 +++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index bf749676da0..9535a02ac9d 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -1411,6 +1411,35 @@ use_hw_binning(struct tu_cmd_buffer *cmd)
+    return vsc->binning_possible && vsc->binning_useful;
+ }
+ 
++/* Two or more attachments of the pass view the same subresource (same image,
++ * same mip, overlapping layers). In GMEM each attachment gets its own tile
++ * copy and each copy is resolved back to memory, so the copy stored last
++ * overwrites what the other attachment drew. Sysmem writes the shared memory
++ * directly, which is the behavior the application expects.
++ */
++static bool
++tu_pass_has_aliased_attachments(const struct tu_cmd_buffer *cmd)
++{
++   const struct tu_render_pass *pass = cmd->state.pass;
++   if (!pass || !cmd->state.attachments)
++      return false;
++   for (uint32_t i = 0; i < pass->attachment_count; ++i) {
++      const struct tu_image_view *a = cmd->state.attachments[i];
++      if (!a)
++         continue;
++      for (uint32_t j = i + 1; j < pass->attachment_count; ++j) {
++         const struct tu_image_view *b = cmd->state.attachments[j];
++         if (!b || b->image != a->image ||
++             b->vk.base_mip_level != a->vk.base_mip_level)
++            continue;
++         if (a->vk.base_array_layer < b->vk.base_array_layer + b->vk.layer_count &&
++             b->vk.base_array_layer < a->vk.base_array_layer + a->vk.layer_count)
++            return true;
++      }
++   }
++   return false;
++}
++
+ static bool
+ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
+                      tu_autotune::rp_ctx_t *rp_ctx,
+@@ -1452,6 +1481,11 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
+       return true;
+    }
+ 
++   if (tu_pass_has_aliased_attachments(cmd)) {
++      cmd->state.rp.force_render_mode_reason = "Aliased attachments";
++      return true;
++   }
++
+    const struct tu_vsc_config *vsc = tu_vsc_config(cmd, cmd->state.tiling);
+ 
+    /* XFB is incompatible with non-hw binning GMEM rendering, see use_hw_binning */
+-- 
+2.43.0
+

@@ -1,0 +1,723 @@
+--- a/src/freedreno/ir3/ir3_spill.c
++++ b/src/freedreno/ir3/ir3_spill.c
+@@ -6,6 +6,7 @@
+ #include "util/rb_tree.h"
+ #include "ir3_ra.h"
+ #include "ir3_shader.h"
++#include "regspill_build.h"
+ 
+ /*
+  * This pass does two things:
+@@ -2170,6 +2171,145 @@
+    ralloc_free(ctx);
+ }
+ 
++extern bool ir3_audit_regspill_trial(void);
++extern void ir3_audit_regspill_mark(void);
++struct audit_regspill_pair {
++   unsigned offset;
++   struct ir3_instruction *store, *load, *backup;
++   struct ir3_instruction saved_load;
++   struct ir3_register *saved_src0;
++};
++
++static bool
++audit_try_register_backing(struct ir3 *ir, struct ir3_shader_variant *v,
++                          struct ir3_liveness **live,
++                          const struct ir3_pressure *limits,
++                          unsigned original_private, unsigned slots)
++{
++   if (!ir3_audit_regspill_trial() || original_private ||
++       !v->mergedregs || v->type != MESA_SHADER_COMPUTE ||
++       limits->half != 192 || limits->full != 384 || slots > 256)
++      return false;
++
++   void *mem_ctx = ralloc_parent(*live);
++   struct audit_regspill_pair *pairs =
++      rzalloc_array(NULL, struct audit_regspill_pair, 128);
++   if (!pairs)
++      return false;
++   unsigned count = 0;
++   bool supported = true;
++   foreach_block (block, &ir->block_list) {
++      foreach_instr (instr, &block->instr_list) {
++         if (instr->opc != OPC_SPILL_MACRO && instr->opc != OPC_RELOAD_MACRO)
++            continue;
++         if (instr->cat6.type != TYPE_U16 || instr->srcs_count != 3 ||
++             instr->srcs[2]->uim_val != 1 || instr->repeat || instr->deps_count) {
++            supported = false;
++            break;
++         }
++         unsigned offset = instr->opc == OPC_SPILL_MACRO ?
++            instr->cat6.dst_offset : instr->srcs[1]->uim_val;
++         unsigned n = 0;
++         while (n < count && pairs[n].offset != offset)
++            n++;
++         if (instr->opc == OPC_SPILL_MACRO) {
++            if (n != count || count == 128 ||
++                instr->srcs[1]->flags & (IR3_REG_ARRAY | IR3_REG_RELATIV) ||
++                !instr->srcs[1]->def) {
++               supported = false;
++               break;
++            }
++            pairs[count].offset = offset;
++            pairs[count++].store = instr;
++         } else {
++            if (n == count || pairs[n].load || pairs[n].store->block != block ||
++                instr->dsts_count != 1 || reg_elems(instr->dsts[0]) != 1 ||
++                instr->dsts[0]->flags & IR3_REG_ARRAY) {
++               supported = false;
++               break;
++            }
++            pairs[n].load = instr;
++         }
++      }
++      if (!supported)
++         break;
++   }
++   if (count == 0)
++      supported = false;
++   for (unsigned n = 0; n < count; n++)
++      supported &= pairs[n].load != NULL;
++   if (!supported) {
++      ralloc_free(pairs);
++      return false;
++   }
++
++   for (unsigned n = 0; n < count; n++) {
++      struct audit_regspill_pair *pair = &pairs[n];
++      struct ir3_instruction *mov =
++         ir3_instr_create_at(ir3_before_instr(pair->store), OPC_MOV, 1, 1);
++      struct ir3_register *dst = __ssa_dst(mov);
++      dst->wrmask = 1;
++      struct ir3_register *src =
++         ir3_src_create(mov, INVALID_REG, IR3_REG_SSA | IR3_REG_HALF);
++      src->def = pair->store->srcs[1]->def;
++      src->wrmask = 1;
++      mov->cat1.src_type = TYPE_U16;
++      mov->cat1.dst_type = TYPE_U32;
++      pair->backup = mov;
++      pair->saved_load = *pair->load;
++      pair->saved_src0 = pair->load->srcs[0];
++      pair->load->opc = OPC_MOV;
++      pair->load->srcs_count = 0;
++      struct ir3_register *reload_src =
++         ir3_src_create(pair->load, INVALID_REG, IR3_REG_SSA);
++      reload_src->def = dst;
++      reload_src->wrmask = 1;
++      memset(&pair->load->cat1, 0, sizeof(pair->load->cat1));
++      pair->load->cat1.src_type = TYPE_U32;
++      pair->load->cat1.dst_type = TYPE_U16;
++      list_delinit(&pair->store->node);
++   }
++
++   ralloc_free(*live);
++   *live = ir3_calc_liveness(mem_ctx, ir);
++   fixup_merge_sets(*live, ir);
++   struct ir3_pressure pressure;
++   ir3_calc_pressure(v, *live, &pressure);
++   unsigned cap = limits->full;
++   const char *cap_env = SNAPRYU_REGSPILL_DIAGNOSTIC ? getenv("IR3_REGSPILL_CAP") : NULL;
++   if (cap_env)
++      cap = MIN2(cap, (unsigned)strtoul(cap_env, NULL, 10));
++   if (pressure.full > cap || pressure.half > limits->half ||
++       pressure.shared > limits->shared || pressure.shared_half > limits->shared_half) {
++      for (unsigned n = 0; n < count; n++) {
++         struct audit_regspill_pair *pair = &pairs[n];
++         pair->load->opc = pair->saved_load.opc;
++         pair->load->cat6 = pair->saved_load.cat6;
++         pair->load->srcs_count = pair->saved_load.srcs_count;
++         pair->load->srcs[0] = pair->saved_src0;
++         ir3_instr_move_before(pair->store, pair->backup);
++         list_delinit(&pair->backup->node);
++      }
++      ralloc_free(*live);
++      *live = ir3_calc_liveness(mem_ctx, ir);
++      fixup_merge_sets(*live, ir);
++      REGSPILL_LOG("REGSPILL shader=%u pairs=%u action=fallback full=%u half=%u cap=%u\n",
++              v->shader_id, count, pressure.full, pressure.half, cap);
++      ralloc_free(pairs);
++      return false;
++   }
++
++   ralloc_free(*live);
++   *live = ir3_calc_liveness(mem_ctx, ir);
++   fixup_merge_sets(*live, ir);
++   ir3_calc_pressure(v, *live, &pressure);
++   REGSPILL_LOG("REGSPILL shader=%u pairs=%u action=accepted full=%u half=%u cap=%u\n",
++           v->shader_id, count, pressure.full, pressure.half, cap);
++   ralloc_free(pairs);
++   ir3_audit_regspill_mark();
++   return true;
++}
++
+ bool
+ ir3_spill(struct ir3 *ir, struct ir3_shader_variant *v,
+           struct ir3_liveness **live,
+@@ -2218,6 +2358,9 @@
+ 
+    fixup_merge_sets(*live, ir);
+ 
++   if (audit_try_register_backing(ir, v, live, limit_pressure, v->pvtmem_size, ctx->spill_slot))
++      ctx->spill_slot = v->pvtmem_size;
++
+    v->pvtmem_size = ctx->spill_slot;
+    ralloc_free(ctx);
+ 
+--- a/src/freedreno/ir3/ir3_shader.c
++++ b/src/freedreno/ir3/ir3_shader.c
+@@ -19,6 +19,7 @@
+ #include "ir3_nir.h"
+ #include "ir3_parser.h"
+ #include "ir3_shader.h"
++#include "regspill_build.h"
+ #include "util/memstream.h"
+ 
+ #include "nir/nir.h"
+@@ -507,10 +508,63 @@
+    }
+ }
+ 
++
++static _Thread_local bool audit_trial_active, audit_trial_modified;
++static unsigned audit_accepted_count, audit_retry_count;
++bool ir3_audit_regspill_trial(void);
++bool ir3_audit_regspill_modified(void);
++void ir3_audit_regspill_mark(void);
++
++bool ir3_audit_regspill_trial(void) { return audit_trial_active; }
++bool ir3_audit_regspill_modified(void) { return audit_trial_modified; }
++void ir3_audit_regspill_mark(void) { audit_trial_modified = true; }
++
++static int
++audit_compile_with_retry(struct ir3_shader *shader, struct ir3_shader_variant *v)
++{
++   const char *enable = getenv("IR3_REGSPILL_AUDIT");
++   if ((enable && strcmp(enable, "1")) || v->type != MESA_SHADER_COMPUTE ||
++       v->binning_pass || !v->mergedregs || !v->const_state)
++      return ir3_compile_shader_nir(shader->compiler, shader, v);
++
++   struct ir3_shader_variant *trial = rzalloc(v, struct ir3_shader_variant);
++   if (!trial)
++      return ir3_compile_shader_nir(shader->compiler, shader, v);
++   *trial = *v;
++   trial->const_state = rzalloc(trial, struct ir3_const_state);
++   if (!trial->const_state) {
++      ralloc_free(trial);
++      return ir3_compile_shader_nir(shader->compiler, shader, v);
++   }
++   *trial->const_state = *v->const_state;
++   audit_trial_active = true;
++   audit_trial_modified = false;
++   int ret = ir3_compile_shader_nir(shader->compiler, shader, trial);
++   bool modified = audit_trial_modified;
++   audit_trial_active = false;
++   audit_trial_modified = false;
++   if (!ret) {
++      ralloc_free(v->const_state);
++      *v = *trial;
++      ralloc_adopt(v, trial);
++      ralloc_free(trial);
++      if (modified)
++         REGSPILL_LOG("REGSPILL_RESULT shader=%u accepted_total=%u retry_total=%u outcome=accepted\n",
++                 v->shader_id, p_atomic_inc_return(&audit_accepted_count), p_atomic_read(&audit_retry_count));
++      return 0;
++   }
++   ralloc_free(trial);
++   unsigned retry = p_atomic_inc_return(&audit_retry_count);
++   ret = ir3_compile_shader_nir(shader->compiler, shader, v);
++   REGSPILL_LOG("REGSPILL_RESULT shader=%u accepted_total=%u retry_total=%u outcome=memory_retry result=%d modified=%u\n",
++           v->shader_id, p_atomic_read(&audit_accepted_count), retry, ret, modified);
++   return ret;
++}
++
+ static bool
+ compile_variant(struct ir3_shader *shader, struct ir3_shader_variant *v)
+ {
+-   int ret = ir3_compile_shader_nir(shader->compiler, shader, v);
++   int ret = audit_compile_with_retry(shader, v);
+    if (ret) {
+       mesa_loge("compile failed! (%s:%s)", shader->nir->info.name,
+                 shader->nir->info.label);
+--- a/src/freedreno/ir3/ir3_ra.c
++++ b/src/freedreno/ir3/ir3_ra.c
+@@ -8,6 +8,32 @@
+ #include "util/rb_tree.h"
+ #include "util/u_math.h"
+ #include "ir3_shader.h"
++#include "regspill_build.h"
++
++#include <setjmp.h>
++extern bool ir3_audit_regspill_modified(void);
++static _Thread_local jmp_buf *audit_ra_target;
++bool ir3_audit_ra_recovery_active(void);
++void ir3_audit_ra_failure(const char *reason);
++
++bool ir3_audit_ra_recovery_active(void)
++{
++   return audit_ra_target && ir3_audit_regspill_modified();
++}
++
++void ir3_audit_ra_failure(const char *reason)
++{
++   REGSPILL_LOG("REGSPILL_RA_FAILURE reason=%s\n", reason);
++   longjmp(*audit_ra_target, 1);
++}
++
++#define audit_ra_assert(condition) do { \
++   if (ir3_audit_ra_recovery_active() && !(condition)) \
++      ir3_audit_ra_failure(#condition); \
++   assert(condition); \
++} while (0)
++
++
+ 
+ /* This file implements an SSA-based register allocator. Unlike other
+  * SSA-based allocators, it handles vector split/collect "smartly," meaning
+@@ -111,13 +137,13 @@
+        * be small enough to be used as a half-reg source? Let's keep that
+        * can of worms firmly shut for now.
+        */
+-      assert((interval->reg->flags & IR3_REG_HALF) ==
++      audit_ra_assert((interval->reg->flags & IR3_REG_HALF) ==
+              (right->reg->flags & IR3_REG_HALF));
+ 
+       if (right->reg->interval_end <= interval->reg->interval_end &&
+           right->reg->interval_start >= interval->reg->interval_start) {
+          /* Check if we're inserting something that's already inserted */
+-         assert(interval != right);
++         audit_ra_assert(interval != right);
+ 
+          /* "right" is contained in "interval" and must become a child of
+           * it. There may be further children too.
+@@ -126,8 +152,8 @@
+               right && right->reg->interval_start < interval->reg->interval_end;
+               right = next, next = ir3_reg_interval_next_or_null(next)) {
+             /* "right" must be contained in "interval." */
+-            assert(right->reg->interval_end <= interval->reg->interval_end);
+-            assert((interval->reg->flags & IR3_REG_HALF) ==
++            audit_ra_assert(right->reg->interval_end <= interval->reg->interval_end);
++            audit_ra_assert((interval->reg->flags & IR3_REG_HALF) ==
+                    (right->reg->flags & IR3_REG_HALF));
+             if (!right->parent)
+                ctx->interval_delete(ctx, right);
+@@ -140,7 +166,7 @@
+          /* "right" must contain "interval," since intervals must form a
+           * tree.
+           */
+-         assert(right->reg->interval_start <= interval->reg->interval_start);
++         audit_ra_assert(right->reg->interval_start <= interval->reg->interval_start);
+          interval->parent = right;
+          interval_insert(ctx, &right->children, interval);
+          return;
+@@ -175,7 +201,7 @@
+ ir3_reg_interval_remove(struct ir3_reg_ctx *ctx,
+                         struct ir3_reg_interval *interval)
+ {
+-   assert(interval->inserted);
++   audit_ra_assert(interval->inserted);
+ 
+    if (interval->parent) {
+       rb_tree_remove(&interval->parent->children, &interval->node);
+@@ -216,7 +242,7 @@
+ ir3_reg_interval_remove_all(struct ir3_reg_ctx *ctx,
+                             struct ir3_reg_interval *interval)
+ {
+-   assert(!interval->parent);
++   audit_ra_assert(!interval->parent);
+ 
+    ctx->interval_delete(ctx, interval);
+    rb_tree_remove(&ctx->intervals, &interval->node);
+@@ -230,7 +256,7 @@
+ ir3_reg_interval_remove_temp(struct ir3_reg_ctx *ctx,
+                              struct ir3_reg_interval *interval)
+ {
+-   assert(!interval->parent);
++   audit_ra_assert(!interval->parent);
+ 
+    ctx->interval_delete(ctx, interval);
+    rb_tree_remove(&ctx->intervals, &interval->node);
+@@ -389,7 +415,7 @@
+ static struct ra_interval *
+ ra_interval_get(struct ra_ctx *ctx, struct ir3_register *dst)
+ {
+-   assert(dst->name != 0 && dst->name < ctx->live->definitions_count);
++   audit_ra_assert(dst->name != 0 && dst->name < ctx->live->definitions_count);
+    return &ctx->intervals[dst->name];
+ }
+ 
+@@ -540,10 +566,10 @@
+ static void
+ ra_file_insert(struct ra_file *file, struct ra_interval *interval)
+ {
+-   assert(interval->physreg_start < interval->physreg_end);
+-   assert(interval->physreg_end <= file->size);
++   audit_ra_assert(interval->physreg_start < interval->physreg_end);
++   audit_ra_assert(interval->physreg_end <= file->size);
+    if (interval->interval.reg->flags & IR3_REG_HALF)
+-      assert(interval->physreg_end <= RA_HALF_SIZE);
++      audit_ra_assert(interval->physreg_end <= RA_HALF_SIZE);
+ 
+    ir3_reg_interval_insert(&file->reg_ctx, &interval->interval);
+ }
+@@ -557,7 +583,7 @@
+ static void
+ ra_file_mark_killed(struct ra_file *file, struct ra_interval *interval)
+ {
+-   assert(!interval->interval.parent);
++   audit_ra_assert(!interval->interval.parent);
+ 
+    for (physreg_t i = interval->physreg_start; i < interval->physreg_end; i++) {
+       BITSET_SET(file->available, i);
+@@ -569,7 +595,7 @@
+ static void
+ ra_file_unmark_killed(struct ra_file *file, struct ra_interval *interval)
+ {
+-   assert(!interval->interval.parent);
++   audit_ra_assert(!interval->interval.parent);
+ 
+    for (physreg_t i = interval->physreg_start; i < interval->physreg_end; i++) {
+       BITSET_CLEAR(file->available, i);
+@@ -681,9 +707,9 @@
+ ra_pop_interval(struct ra_ctx *ctx, struct ra_file *file,
+                 struct ra_interval *interval)
+ {
+-   assert(!interval->interval.parent);
++   audit_ra_assert(!interval->interval.parent);
+    /* shared live splitting is not allowed! */
+-   assert(!(interval->interval.reg->flags & IR3_REG_SHARED));
++   audit_ra_assert(!(interval->interval.reg->flags & IR3_REG_SHARED));
+ 
+    /* Check if we've already moved this reg before */
+    unsigned pcopy_index;
+@@ -718,9 +744,9 @@
+    interval->physreg_start = dst;
+    interval->physreg_end = dst + removed->size;
+ 
+-   assert(interval->physreg_end <= file->size);
++   audit_ra_assert(interval->physreg_end <= file->size);
+    if (interval->interval.reg->flags & IR3_REG_HALF)
+-      assert(interval->physreg_end <= RA_HALF_SIZE);
++      audit_ra_assert(interval->physreg_end <= RA_HALF_SIZE);
+ 
+    ir3_reg_interval_reinsert(&file->reg_ctx, &interval->interval);
+ }
+@@ -766,7 +792,7 @@
+          continue;
+ 
+       struct ra_interval *other_interval = ra_interval_get(ctx, other_dst);
+-      assert(!other_interval->interval.parent);
++      audit_ra_assert(!other_interval->interval.parent);
+       physreg_t other_start = other_interval->physreg_start;
+       physreg_t other_end = other_interval->physreg_end;
+ 
+@@ -840,7 +866,7 @@
+          continue;
+ 
+       if (conflicting->frozen) {
+-         assert(speculative);
++         audit_ra_assert(speculative);
+          return false;
+       }
+ 
+@@ -1144,7 +1170,7 @@
+       /* We assume that all frozen intervals are at the start and that we
+        * can avoid popping them.
+        */
+-      assert(!interval->frozen);
++      audit_ra_assert(!interval->frozen);
+ 
+       /* Killed sources are different because they go at the end and can
+        * overlap the register we're trying to add.
+@@ -1214,7 +1240,7 @@
+             process_dst = true;
+          } else {
+             /* far right of diagram. */
+-            assert(!live_killed && !live_half);
++            audit_ra_assert(!live_killed && !live_half);
+             process_dst = false;
+          }
+       }
+@@ -1392,10 +1418,10 @@
+                         struct ir3_register *reg,
+                         enum ir3_subreg_move subreg_move)
+ {
+-   assert(subreg_move != IR3_SUBREG_MOVE_NONE);
++   audit_ra_assert(subreg_move != IR3_SUBREG_MOVE_NONE);
+ 
+    /* Subreg moves always write a half register. */
+-   assert(reg_elem_size(reg) == 1);
++   audit_ra_assert(reg_elem_size(reg) == 1);
+ 
+    struct ir3_register *src = reg->instr->srcs[0];
+    if (!ra_reg_is_src(src) || ra_get_file(ctx, src) != file)
+@@ -1418,7 +1444,7 @@
+ static bool
+ rpt_has_unique_merge_set(struct ir3_instruction *instr)
+ {
+-   assert(ir3_instr_is_rpt(instr));
++   audit_ra_assert(ir3_instr_is_rpt(instr));
+ 
+    if (!instr->dsts[0]->merge_set)
+       return false;
+@@ -1565,7 +1591,7 @@
+    if (best_eviction_count != ~0) {
+       ASSERTED bool result = try_evict_regs(
+          ctx, file, reg, best_reg, &best_eviction_count, false, false);
+-      assert(result);
++      audit_ra_assert(result);
+       return best_reg;
+    }
+ 
+@@ -2047,7 +2073,7 @@
+     * correctly.
+     */
+    ra_foreach_src (src, instr) {
+-      assert(src->num != INVALID_REG);
++      audit_ra_assert(src->num != INVALID_REG);
+       handle_precolored_source(ctx, src);
+    }
+ 
+@@ -2091,7 +2117,7 @@
+       break;
+    }
+ 
+-   assert(physreg != (physreg_t)~0);
++   audit_ra_assert(physreg != (physreg_t)~0);
+ 
+    struct ra_interval *interval = ra_interval_get(ctx, def);
+    struct ra_file *file = ra_get_file(ctx, def);
+@@ -2155,7 +2181,7 @@
+ 
+    struct ra_file *file = ra_get_file(ctx, phi->dsts[0]);
+    struct ra_interval *interval = ra_interval_get(ctx, phi->dsts[0]);
+-   assert(!interval->interval.parent);
++   audit_ra_assert(!interval->interval.parent);
+    unsigned num = ra_interval_get_num(interval);
+    assign_reg(phi, phi->dsts[0], num);
+ 
+@@ -2247,7 +2273,7 @@
+ 
+       physreg_t pred_reg = read_register(ctx, pred, interval->interval.reg);
+       if (pred_reg != physreg) {
+-         assert(!(interval->interval.reg->flags & IR3_REG_SHARED));
++         audit_ra_assert(!(interval->interval.reg->flags & IR3_REG_SHARED));
+          insert_liveout_copy(pred, physreg, pred_reg, interval->interval.reg);
+       }
+    }
+@@ -2352,8 +2378,8 @@
+ static bool
+ has_merge_set_preferred_reg(struct ir3_register *reg)
+ {
+-   assert(reg->merge_set);
+-   assert(reg->num != INVALID_REG);
++   audit_ra_assert(reg->merge_set);
++   audit_ra_assert(reg->num != INVALID_REG);
+ 
+    return reg->merge_set->preferred_reg != (physreg_t)~0 &&
+           ra_reg_get_physreg(reg) ==
+@@ -2396,7 +2422,7 @@
+          }
+ 
+          struct ir3_register *dst = input->dsts[0];
+-         assert(dst->num != INVALID_REG);
++         audit_ra_assert(dst->num != INVALID_REG);
+ 
+          physreg_t dst_end;
+ 
+@@ -2749,7 +2775,7 @@
+    uint32_t vec4_regs_per_thread =
+       compiler->reg_size_vec4 /
+       (wave_pairs_per_wg * (double_threadsize ? 2 : 1));
+-   assert(vec4_regs_per_thread > 0);
++   audit_ra_assert(vec4_regs_per_thread > 0);
+ 
+    return vec4_regs_per_thread * 4 * 2;
+ }
+@@ -2779,7 +2805,7 @@
+          MIN2(limit_pressure.full, v->compiler->reg_size_vec4 / 2 * 16);
+    }
+ 
+-   assert(limit_pressure.full <= RA_FULL_SIZE);
++   audit_ra_assert(limit_pressure.full <= RA_FULL_SIZE);
+ 
+    return limit_pressure;
+ }
+@@ -2795,6 +2821,15 @@
+    ir3_create_parallel_copies(v->ir);
+ 
+    struct ra_ctx *ctx = rzalloc(NULL, struct ra_ctx);
++   jmp_buf audit_target;
++   jmp_buf *previous_target = audit_ra_target;
++   if (setjmp(audit_target)) {
++      audit_ra_target = previous_target;
++      ralloc_free(ctx);
++      return -2;
++   }
++   audit_ra_target = &audit_target;
++
+ 
+    ctx->merged_regs = v->mergedregs;
+    ctx->compiler = v->compiler;
+@@ -2895,7 +2930,7 @@
+       d("\thalf: %u", max_pressure.half);
+       d("\tshared: %u", max_pressure.shared);
+ 
+-      assert(max_pressure.full <= limit_pressure.full &&
++      audit_ra_assert(max_pressure.full <= limit_pressure.full &&
+              max_pressure.half <= limit_pressure.half);
+       spilled = true;
+    }
+@@ -2908,7 +2943,7 @@
+    unsigned full_limit = v->mergedregs ? RA_FULL_SIZE : limit_pressure.full;
+ 
+    ctx->full.size = calc_target_full_pressure(v, max_pressure.full, full_limit);
+-   assert(ctx->full.size <= full_limit);
++   audit_ra_assert(ctx->full.size <= full_limit);
+    d("full size: %u", ctx->full.size);
+ 
+    if (!v->mergedregs)
+@@ -2921,6 +2956,9 @@
+    foreach_block (block, &v->ir->block_list)
+       handle_block(ctx, block);
+ 
++   const char *force_retry = SNAPRYU_REGSPILL_DIAGNOSTIC ? getenv("IR3_REGSPILL_FORCE_RETRY") : NULL;
++   if (ir3_audit_ra_recovery_active() && force_retry && !strcmp(force_retry, "1"))
++      ir3_audit_ra_failure("diagnostic_forced_after_physical_allocation");
+    ir3_ra_validate(v, ctx->full.size, ctx->half.size, live->block_count, false);
+ 
+    /* Strip array-ness and SSA-ness at the end, because various helpers still
+@@ -2962,10 +3000,12 @@
+ 
+    ir3_debug_print(v->ir, "AFTER: ir3_lower_copies");
+ 
++   audit_ra_target = previous_target;
+    ralloc_free(ctx);
+ 
+    return 0;
+ fail:
++   audit_ra_target = previous_target;
+    ralloc_free(ctx);
+    return -1;
+ }
+--- a/src/freedreno/ir3/ir3_ra_validate.c
++++ b/src/freedreno/ir3/ir3_ra_validate.c
+@@ -6,6 +6,9 @@
+ #include "util/ralloc.h"
+ #include "ir3_ra.h"
+ #include "ir3_shader.h"
++#include "regspill_build.h"
++extern bool ir3_audit_ra_recovery_active(void);
++extern void ir3_audit_ra_failure(const char *reason);
+ 
+ /* This file implements a validation pass for register allocation. We check
+  * that the assignment of SSA values to registers is "valid", in the sense
+@@ -97,9 +100,24 @@
+    bool failed;
+ };
+ 
++static _Thread_local struct ra_val_ctx *audit_val_current;
++#define audit_val_assert(condition) do { \
++   if (ir3_audit_ra_recovery_active() && !(condition)) { \
++      ralloc_free(audit_val_current); \
++      audit_val_current = NULL; \
++      ir3_audit_ra_failure(#condition); \
++   } \
++   assert(condition); \
++} while (0)
++
+ static void
+ validate_error(struct ra_val_ctx *ctx, const char *condstr)
+ {
++   if (ir3_audit_ra_recovery_active()) {
++      audit_val_current = NULL;
++      ralloc_free(ctx);
++      ir3_audit_ra_failure(condstr);
++   }
+    fprintf(stderr, "ra validation fail: %s\n", condstr);
+    fprintf(stderr, "  -> for instruction: ");
+    ir3_print_instr(ctx->current_instr);
+@@ -426,7 +444,7 @@
+ 
+       offset += reg_size(dst);
+    }
+-   assert(offset == size);
++   audit_val_assert(offset == size);
+ 
+    offset = 0;
+    for (unsigned i = 0; i < pcopy->dsts_count; i++) {
+@@ -445,7 +463,7 @@
+ 
+       offset += reg_size(dst);
+    }
+-   assert(offset == size);
++   audit_val_assert(offset == size);
+ }
+ 
+ static void
+@@ -458,7 +476,7 @@
+              reg_size(instr->srcs[0]) * sizeof(struct reg_state));
+    } else { /* reload */
+       struct reg_state *state = get_spill_state(ctx, instr->srcs[0]->def);
+-      assert(state);
++      audit_val_assert(state);
+       physreg_t dst_physreg = ra_reg_get_physreg(instr->dsts[0]);
+       memcpy(&ctx->reaching.shared.regs[dst_physreg], state,
+              reg_size(instr->dsts[0]) * sizeof(struct reg_state));
+@@ -548,7 +566,7 @@
+                break;
+             }
+          }
+-         assert(dst_idx != ~0);
++         audit_val_assert(dst_idx != ~0);
+ 
+          struct ir3_register *new_def = instr->srcs[dst_idx]->def;
+          if (new_def) {
+@@ -575,7 +593,7 @@
+               "more than one reaching definition or partial definition");
+    } else {
+       /* The analysis should always remove UNKNOWN eventually. */
+-      assert(state->def != UNKNOWN);
++      audit_val_assert(state->def != UNKNOWN);
+ 
+       const char *prefix = "r";
+       unsigned num = state->def->num / 4;
+@@ -692,6 +710,11 @@
+    }
+ 
+    if (ctx->failed) {
++      if (ir3_audit_ra_recovery_active()) {
++         audit_val_current = NULL;
++         ralloc_free(ctx);
++         ir3_audit_ra_failure("reaching_definitions");
++      }
+       fprintf(stderr, "failing shader:\n");
+       ir3_print(ir);
+       abort();
+@@ -708,10 +731,11 @@
+ #define VALIDATE 1
+ #endif
+ 
+-   if (!VALIDATE)
++   if (!VALIDATE && !ir3_audit_ra_recovery_active())
+       return;
+ 
+    struct ra_val_ctx *ctx = rzalloc(NULL, struct ra_val_ctx);
++   audit_val_current = ctx;
+    ctx->merged_regs = v->mergedregs;
+    ctx->full_size = full_size;
+    ctx->half_size = half_size;
+@@ -729,5 +753,6 @@
+ 
+    check_reaching_defs(ctx, v->ir);
+ 
++   audit_val_current = NULL;
+    ralloc_free(ctx);
+ }
+--- /dev/null
++++ b/src/freedreno/ir3/regspill_build.h
+@@ -0,0 +1,4 @@
++#ifndef SNAPRYU_REGSPILL_DIAGNOSTIC
++#define SNAPRYU_REGSPILL_DIAGNOSTIC 0
++#endif
++#define REGSPILL_LOG(...) do { if (SNAPRYU_REGSPILL_DIAGNOSTIC) fprintf(stderr, __VA_ARGS__); } while (0)
