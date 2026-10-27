@@ -1,0 +1,13 @@
+LIBRARY lsfg_arm64_v2
+EXPORTS
+    lsfg_cemu_create
+    lsfg_cemu_set_enabled
+    lsfg_cemu_create_context
+    lsfg_cemu_generate
+    lsfg_cemu_generate_async
+    lsfg_cemu_reset_history
+    lsfg_cemu_drain
+    lsfg_cemu_destroy_context
+    lsfg_cemu_destroy
+    lsfg_cemu_get_stats
+    lsfg_cemu_status_string

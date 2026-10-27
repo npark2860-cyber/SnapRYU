@@ -1,0 +1,41 @@
+{
+  "schema": "lsfg-cemu-validation.v1",
+  "recorded_at": "2026-09-28",
+  "artifact": {
+    "file": "lib/lsfg_cemu_arm64.lib",
+    "platform": "Windows ARM64",
+    "coff_machine": "AA64",
+    "configuration": "Release",
+    "compiler": "MSVC 14.52",
+    "size_bytes": 7746282,
+    "sha256": "e8e646ff2863c13c507e7f742968f4701f5b4c189bb057560f6d982e72dda5a1"
+  },
+  "build": {
+    "result": "PASS",
+    "command": "cmake --build build/lsfg-cemu-arm64 --parallel 4",
+    "native_arm64_dumpbin_header": "PASS"
+  },
+  "tests": {
+    "result": "PASS",
+    "passed": 2,
+    "total": 2,
+    "c_header": "PASS",
+    "failure_contracts": "PASS",
+    "failure_contract_checks": 76
+  },
+  "runtime": {
+    "module_gpu_execution": "NOT_RUN",
+    "cemu_renderer_integration": "NOT_RUN",
+    "full_frame_correctness": "FAIL",
+    "known_fixture": "A=A boundary 5 pixels; maximum RGB error 8"
+  },
+  "scope": {
+    "lossless_dll_included": false,
+    "shader_payload_included": false,
+    "limitations": [
+      "No standalone Vulkan runtime host is packaged.",
+      "Actual Cemu renderer integration remains to be done.",
+      "LSFG core uses GPL-3.0-or-later source; preserve notices and comply with its terms when redistributing or linking."
+    ]
+  }
+}

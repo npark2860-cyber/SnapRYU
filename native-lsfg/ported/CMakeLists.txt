@@ -1,0 +1,38 @@
+cmake_minimum_required(VERSION 3.24)
+project(LSFGCemu VERSION 0.1.0 LANGUAGES C CXX)
+if(NOT WIN32 OR NOT MSVC)
+  message(FATAL_ERROR "LSFGCemu v1 is verified only with Windows ARM64 MSVC")
+endif()
+if(NOT CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "ARM64")
+  message(FATAL_ERROR "Use the native ARM64 MSVC toolchain (not x64/ARM64EC)")
+endif()
+set(_legacy "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lsfg_legacy")
+file(GLOB _common CONFIGURE_DEPENDS "${_legacy}/lsfg-vk-common/src/vulkan/*.cpp")
+file(GLOB _backend CONFIGURE_DEPENDS "${_legacy}/lsfg-vk-backend/src/helpers/*.cpp"
+  "${_legacy}/lsfg-vk-backend/src/extraction/*.cpp" "${_legacy}/lsfg-vk-backend/src/shaderchains/*.cpp")
+add_library(lsfg_cemu_arm64 STATIC src/lsfg_cemu.cpp ${_common} ${_backend}
+  "${_legacy}/lsfg-vk-common/src/helpers/errors.cpp" "${_legacy}/lsfg-vk-backend/src/lsfgvk.cpp")
+add_library(LSFGCemu::LSFGCemu ALIAS lsfg_cemu_arm64)
+target_compile_features(lsfg_cemu_arm64 PRIVATE cxx_std_20)
+target_include_directories(lsfg_cemu_arm64 PUBLIC
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan_headers/include>"
+  PRIVATE "${_legacy}/lsfg-vk-common/include" "${_legacy}/lsfg-vk-backend/include" "${_legacy}/lsfg-vk-backend/src")
+target_compile_definitions(lsfg_cemu_arm64 PRIVATE VK_NO_PROTOTYPES NOMINMAX WIN32_LEAN_AND_MEAN
+  _CRT_SECURE_NO_WARNINGS vk=lsfg_cemu_private_vk ls=lsfg_cemu_private_ls lsfgvk=lsfg_cemu_private_backend)
+target_compile_options(lsfg_cemu_arm64 PRIVATE /utf-8 /permissive- /EHsc /W3 /wd5030 /wd4068)
+target_link_libraries(lsfg_cemu_arm64 PRIVATE bcrypt)
+option(LSFG_CEMU_BUILD_TESTS "Build API failure/lifetime regression tests" OFF)
+if(LSFG_CEMU_BUILD_TESTS)
+  enable_testing()
+  add_executable(lsfg_cemu_c_header_test tests/c_header.c)
+  target_link_libraries(lsfg_cemu_c_header_test PRIVATE LSFGCemu::LSFGCemu)
+  set_target_properties(lsfg_cemu_c_header_test PROPERTIES LINKER_LANGUAGE CXX)
+  add_test(NAME lsfg_cemu_c_header COMMAND lsfg_cemu_c_header_test)
+  add_executable(lsfg_cemu_failure_contracts tests/failure_contracts.cpp)
+  target_compile_features(lsfg_cemu_failure_contracts PRIVATE cxx_std_20)
+  target_compile_options(lsfg_cemu_failure_contracts PRIVATE /utf-8 /EHsc /W4)
+  target_link_libraries(lsfg_cemu_failure_contracts PRIVATE LSFGCemu::LSFGCemu)
+  add_test(NAME lsfg_cemu_failure_contracts COMMAND lsfg_cemu_failure_contracts)
+  set_tests_properties(lsfg_cemu_failure_contracts PROPERTIES TIMEOUT 20)
+endif()
