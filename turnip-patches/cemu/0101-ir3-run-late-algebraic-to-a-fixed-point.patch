@@ -1,0 +1,21 @@
+--- a/src/freedreno/ir3/ir3_context.c	2026-10-26 04:43:42.152277500 +0000
++++ b/src/freedreno/ir3/ir3_context.c	2026-10-26 04:43:42.084587900 +0000
+@@ -93,9 +93,16 @@
+       needs_late_alg = true;
+    }
+ 
+-   /* nir_opt_algebraic() above would have unfused our ffmas, re-fuse them. */
++   /* nir_opt_algebraic() above would have unfused our ffmas, re-fuse them.
++    * Run late algebraic to a fixed point: one pass can fuse fadd(fmulz) into
++    * fmadz, and only a later pass lowers that fmadz, which ir3 cannot emit.
++    */
+    if (needs_late_alg) {
+-      NIR_PASS(progress, ctx->s, nir_opt_algebraic_late);
++      bool late_progress;
++      do {
++         late_progress = false;
++         NIR_PASS(late_progress, ctx->s, nir_opt_algebraic_late);
++      } while (late_progress);
+       NIR_PASS(progress, ctx->s, nir_opt_dce);
+    }
+ 

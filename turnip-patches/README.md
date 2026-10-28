@@ -33,6 +33,10 @@ We checked that applying all seven to the base gives exactly the source files th
 | 0006 | tu WDDM and Vulkan WSI (SnapRYU) | Each frame was copied once more before display | Present native tiled images on Windows. Also adds frame statistics and GPU timing hooks, which stay off in the shipped build |
 | 0007 | ir3 (SnapRYU) | Some shaders spilled half-size registers to memory | Keep half-size spills in free full registers. Set `IR3_REGSPILL_AUDIT=0` to use the original path |
 
+## Cemu
+
+The `cemu` folder has the Turnip build we use with Cemu: 0001 to 0003 from here plus two Cemu-specific crash fixes. See `cemu/README.md`.
+
 ## Options used by SnapRYU
 
 SnapRYU sets these environment variables for the driver: `TU_WSI_NATIVE_TILED=1`, `TU_WSI_LINEAR_SHARED=0`, `TU_WSI_NATIVE_MAX_LATENCY=2`.
