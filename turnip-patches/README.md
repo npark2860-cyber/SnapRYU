@@ -9,6 +9,10 @@ We publish them so anyone can rebuild the driver, check what we changed, and reu
 - Repository: `https://github.com/strongtz/mesa`
 - Commit: `16f87fbcc8e1aced8b2778e4df639762974f9e34` (Mesa upstream base `7a51c0f5326ee011b16a854499abf1db6f6c8b29`)
 
+## Git branches
+
+The same patches are also applied as commits in `https://github.com/npark2860-cyber/mesa_turnip` (a fork of strongtz/mesa): branch `snapryu` (0001 to 0007) and branch `cemu` (0001 to 0003, 0101, 0102).
+
 ## Apply
 
 ```
