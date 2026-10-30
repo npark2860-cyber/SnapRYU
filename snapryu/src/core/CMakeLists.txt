@@ -1297,6 +1297,8 @@ if (HAS_NCE)
             arm/nce/x18_fallback.h
             arm/nce/x18_site_patcher.cpp
             arm/nce/x18_site_patcher.h
+            hle/service/ro/ro_nce_windows.cpp
+            hle/service/ro/ro_nce_windows.h
             "${NCE_WINDOWS_ENTRY_OBJECT}")
         set_source_files_properties(arm/nce/windows_nce_entry.asm PROPERTIES HEADER_FILE_ONLY TRUE)
     else()

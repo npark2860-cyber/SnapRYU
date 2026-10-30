@@ -41,6 +41,21 @@ void ArmInterface::LogBacktrace(Kernel::KProcess* process) const {
     for (auto const& entry : backtrace)
         msg += fmt::format("{:20}{:016X}    {:016X}    {:016X}    {}\n", entry.module, entry.address, entry.original_address, entry.offset, entry.name);
     LOG_ERROR(Core_ARM, "{}", msg);
+#if SNAPRYU_DIAGNOSTICS
+    // The log backend keeps BUFSIZ bytes per entry, which cuts the message above inside the
+    // register rows. Repeat the frames in short lines so an abort keeps its caller chain.
+    std::string frames;
+    std::size_t frame_index = 0;
+    for (auto const& entry : backtrace) {
+        frames += fmt::format(" {}={:.24}+{:x}", frame_index, entry.module, entry.offset);
+        ++frame_index;
+        if (frames.size() >= 320 || frame_index == backtrace.size()) {
+            LOG_INFO(Render_Vulkan, "NCE_BACKTRACE pc={:x} lr={:x} fp={:x} sp={:x}{}", ctx.pc,
+                     ctx.lr, ctx.fp, ctx.sp, frames);
+            frames.clear();
+        }
+    }
+#endif
 }
 
 const Kernel::DebugWatchpoint* ArmInterface::MatchingWatchpoint(

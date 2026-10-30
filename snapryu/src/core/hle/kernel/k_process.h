@@ -6,7 +6,11 @@
 
 #pragma once
 
+#include <atomic>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <vector>
 #if defined(HAS_NCE) && defined(_WIN32)
 #include "core/arm/nce/windows_patch_recovery_metadata.h"
 #endif
@@ -76,6 +80,10 @@ private:
 #if defined(HAS_NCE) && defined(_WIN32)
     // Declared before ArmInterfaces so it outlives their destruction as well as native epochs.
     Core::NCE::WindowsPatchRecoveryTable m_windows_patch_recovery{};
+    std::atomic<const Core::NCE::WindowsPatchRecoveryTable*> m_windows_patch_recovery_live{
+        std::addressof(m_windows_patch_recovery)};
+    std::vector<std::unique_ptr<Core::NCE::WindowsPatchRecoveryTable>>
+        m_windows_patch_recovery_retired{};
 #endif
     std::array<std::unique_ptr<Core::ArmInterface>, Core::Hardware::NUM_CPU_CORES> m_arm_interfaces{};
     std::array<KThread*, Core::Hardware::NUM_CPU_CORES> m_running_threads{};
@@ -86,6 +94,12 @@ private:
     std::map<KProcessAddress, u64> m_debug_page_refcounts{};
 #ifdef HAS_NCE
     ankerl::unordered_dense::map<u64, u64> m_post_handlers{};
+#if defined(_WIN32)
+    std::atomic<ankerl::unordered_dense::map<u64, u64>*> m_post_handlers_live{
+        std::addressof(m_post_handlers)};
+    std::vector<std::unique_ptr<ankerl::unordered_dense::map<u64, u64>>> m_post_handlers_retired{};
+    std::mutex m_nce_patch_publish_lock{};
+#endif
 #endif
     std::unique_ptr<Core::ExclusiveMonitor> m_exclusive_monitor;
     Core::Memory::Memory m_memory;
@@ -506,13 +520,33 @@ public:
         return m_windows_patch_recovery;
     }
     const Core::NCE::WindowsPatchRecoveryTable& GetWindowsPatchRecovery() const noexcept {
-        return m_windows_patch_recovery;
+        return *m_windows_patch_recovery_live.load(std::memory_order_acquire);
+    }
+    std::mutex& GetNcePatchPublishLock() noexcept {
+        return m_nce_patch_publish_lock;
+    }
+    // ldr:ro publishes rebuilt copies when an NRO is mapped or unmapped. A table is never
+    // mutated once readable; retired tables stay alive for references running threads hold.
+    void PublishNcePatchTables(std::unique_ptr<ankerl::unordered_dense::map<u64, u64>> handlers,
+                               std::unique_ptr<Core::NCE::WindowsPatchRecoveryTable> recovery) {
+        if (handlers != nullptr) {
+            m_post_handlers_live.store(handlers.get(), std::memory_order_release);
+            m_post_handlers_retired.push_back(std::move(handlers));
+        }
+        if (recovery != nullptr) {
+            m_windows_patch_recovery_live.store(recovery.get(), std::memory_order_release);
+            m_windows_patch_recovery_retired.push_back(std::move(recovery));
+        }
     }
 #endif
 
 #ifdef HAS_NCE
     ankerl::unordered_dense::map<u64, u64>& GetPostHandlers() noexcept {
+#if defined(_WIN32)
+        return *m_post_handlers_live.load(std::memory_order_acquire);
+#else
         return m_post_handlers;
+#endif
     }
 #endif
 

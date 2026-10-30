@@ -83,6 +83,7 @@ struct X18AtomicPatchCounts {
     u64 exclusive{};
     u64 lse{};
     u64 sp_base{};
+    u64 pair{};
 
     void Note(bool is_lse, bool sp) noexcept {
         ++(is_lse ? lse : exclusive);
@@ -369,6 +370,89 @@ bool Patcher::PatchText(std::span<const u8> program_image, const Kernel::CodeSet
 
             // The branch above skips this literal at runtime. LDR-literal resolves it while the
             // patch is generated, avoiding any compiler/TEB TLS-offset dependency.
+            cg.l(getter_address);
+            cg.dx(static_cast<u64>(reinterpret_cast<uintptr_t>(
+                &GetCurrentNceContextForGeneratedCode)));
+        };
+
+    // Same frame as the single-instruction exclusive trampoline above, but the load-exclusive and
+    // the store-exclusive run back to back with no memory access between them (see
+    // BuildWindowsX18ExclusivePairPlan).
+    const auto WriteWindowsX18ExclusivePairTrampoline =
+        [&](ModuleDestLabel module_dest, const WindowsX18ExclusivePairPlan& plan,
+            oaknut::VectorCodeGenerator& cg) {
+            constexpr u32 FullSaveFrameSize = 0x130;
+            constexpr u32 VolatileVectorOffset = 0x90;
+            constexpr u32 ScratchPairOffset = 0x110;
+            constexpr u32 LinkRegisterOffset = 0x120;
+            constexpr u32 BlrBase = 0xD63F0000U;
+            constexpr size_t GuestX18Offset =
+                offsetof(GuestContext, cpu_registers) + sizeof(u64) * GuestX18Register;
+
+            const oaknut::XReg value_reg{static_cast<int>(plan.value_scratch)};
+            const oaknut::XReg context_reg{static_cast<int>(plan.context_scratch)};
+            oaknut::Label getter_address;
+
+            cg.SUB(SP, SP, FullSaveFrameSize);
+            for (int i = 0; i <= 16; i += 2) {
+                cg.STP(oaknut::XReg{i}, oaknut::XReg{i + 1}, SP, 8 * i);
+            }
+            for (int i = 0; i <= 6; i += 2) {
+                cg.STP(oaknut::QReg{i}, oaknut::QReg{i + 1}, SP,
+                       VolatileVectorOffset + 16 * i);
+            }
+            cg.STP(value_reg, context_reg, SP, ScratchPairOffset);
+            cg.STR(X30, SP, LinkRegisterOffset);
+
+            cg.LDR(context_reg, getter_address);
+            cg.dw(BlrBase | (plan.context_scratch << 5));
+            cg.MOV(context_reg, X0);
+            cg.LDR(context_reg, context_reg,
+                   offsetof(NativeExecutionParameters, native_context));
+            if (plan.reads_x18) {
+                cg.LDR(value_reg, context_reg, GuestX18Offset);
+            }
+
+            cg.LDR(X30, SP, LinkRegisterOffset);
+            for (int i = 6; i >= 0; i -= 2) {
+                cg.LDP(oaknut::QReg{i}, oaknut::QReg{i + 1}, SP,
+                       VolatileVectorOffset + 16 * i);
+            }
+            for (int i = 16; i >= 0; i -= 2) {
+                cg.LDP(oaknut::XReg{i}, oaknut::XReg{i + 1}, SP, 8 * i);
+            }
+
+            // Both instructions see the guest SP through context_reg when they use an SP base.
+            const bool load_sp = X18AtomicUsesSpBase(plan.rewritten_load);
+            const bool store_sp = X18AtomicUsesSpBase(plan.rewritten_store);
+#if SNAPRYU_DIAGNOSTICS
+            x18_atomic_counts.Note(false, load_sp || store_sp);
+            ++x18_atomic_counts.pair;
+#endif
+            if (load_sp || store_sp) {
+                cg.ADD(context_reg, SP, FullSaveFrameSize);
+            }
+            cg.dw(load_sp ? X18AtomicWithBaseRegister(plan.rewritten_load, plan.context_scratch)
+                          : plan.rewritten_load);
+            cg.dw(store_sp ? X18AtomicWithBaseRegister(plan.rewritten_store, plan.context_scratch)
+                           : plan.rewritten_store);
+
+            if (plan.writes_x18) {
+                WriteWindowsCurrentNceParametersLookup(cg, context_reg);
+                cg.LDR(context_reg, context_reg,
+                       offsetof(NativeExecutionParameters, native_context));
+                cg.STR(value_reg, context_reg, GuestX18Offset);
+            }
+
+            cg.LDP(value_reg, context_reg, SP, ScratchPairOffset);
+            cg.ADD(SP, SP, FullSaveFrameSize);
+
+            if (&cg == &c_pre) {
+                this->BranchToModulePre(module_dest);
+            } else {
+                this->BranchToModule(module_dest);
+            }
+
             cg.l(getter_address);
             cg.dx(static_cast<u64>(reinterpret_cast<uintptr_t>(
                 &GetCurrentNceContextForGeneratedCode)));
@@ -1087,6 +1171,21 @@ bool Patcher::PatchText(std::span<const u8> program_image, const Kernel::CodeSet
 
         if (auto exclusive = Exclusive{inst}; exclusive.Verify()) {
 #if defined(_WIN32)
+            if (i + 1 < static_cast<u32>(text_words.size())) {
+                if (const auto pair =
+                        BuildWindowsX18ExclusivePairPlan(exclusive, Exclusive{text_words[i + 1]})) {
+                    bool pre_buffer = false;
+                    const auto ret = AddRelocations(pre_buffer);
+                    // Resume after the store. The store still gets its own patch on the next
+                    // iteration for code that branches to it directly.
+                    if (pre_buffer) {
+                        WriteWindowsX18ExclusivePairTrampoline(ret + sizeof(u32), *pair, c_pre);
+                    } else {
+                        WriteWindowsX18ExclusivePairTrampoline(ret + sizeof(u32), *pair, c);
+                    }
+                    continue;
+                }
+            }
             if (const auto plan = BuildWindowsX18ExclusivePlan(exclusive)) {
                 bool pre_buffer = false;
                 const auto ret = AddRelocations(pre_buffer);
@@ -1136,8 +1235,9 @@ bool Patcher::PatchText(std::span<const u8> program_image, const Kernel::CodeSet
 #if SNAPRYU_DIAGNOSTICS
 #if defined(_WIN32)
     // One line per patched module, also when it has no x18 atomic: the line proves NCE patching ran.
-    LOG_INFO(Render_Vulkan, "X18_ATOMIC_PATCH exclusive={} lse={} sp_base={} text_bytes={:#x}",
+    LOG_INFO(Render_Vulkan, "X18_ATOMIC_PATCH exclusive={} lse={} sp_base={} pair={} text_bytes={:#x}",
              x18_atomic_counts.exclusive, x18_atomic_counts.lse, x18_atomic_counts.sp_base,
+             x18_atomic_counts.pair,
              code.size);
 #endif
 #endif

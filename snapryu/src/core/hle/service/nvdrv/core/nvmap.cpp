@@ -211,14 +211,23 @@ DAddr NvMap::PinHandle(NvMap::Handle::Id handle, bool low_area_pin) {
             while ((address = smmu.Allocate(aligned_up)) == 0) {
                 // Free handles until the allocation succeeds
                 std::scoped_lock queueLock(unmap_queue_lock);
-                if (auto freeHandleDesc{unmap_queue.front()}) {
-                    // Handles in the unmap queue are guaranteed not to be pinned so don't bother
-                    // checking if they are before unmapping
-                    std::scoped_lock freeLock(freeHandleDesc->mutex);
-                    if (handle_description->d_address)
-                        UnmapHandle(*freeHandleDesc);
-                } else {
+                // SnapRYU: front() of an empty list is undefined (it crashed FF Resonance after
+                // ~12 min). With nothing left to free the pin fails like an unknown handle.
+                if (unmap_queue.empty()) {
                     LOG_CRITICAL(Service_NVDRV, "Ran out of SMMU address space!");
+                    return 0;
+                }
+                auto freeHandleDesc{unmap_queue.front()};
+                // Handles in the unmap queue are guaranteed not to be pinned so don't bother
+                // checking if they are before unmapping
+                std::scoped_lock freeLock(freeHandleDesc->mutex);
+                // SnapRYU: test the queued handle, not the one being pinned (its d_address is 0
+                // here, so nothing was ever freed and the loop never made progress).
+                if (freeHandleDesc->d_address) {
+                    UnmapHandle(*freeHandleDesc);
+                } else {
+                    unmap_queue.erase(*freeHandleDesc->unmap_queue_entry);
+                    freeHandleDesc->unmap_queue_entry.reset();
                 }
             }
 

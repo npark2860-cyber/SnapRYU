@@ -12,6 +12,9 @@
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/ro/ro.h"
 #include "core/hle/service/ro/ro_nro_utils.h"
+#if defined(_WIN32) && defined(HAS_NCE)
+#include "core/hle/service/ro/ro_nce_windows.h"
+#endif
 #include "core/hle/service/ro/ro_results.h"
 #include "core/hle/service/ro/ro_types.h"
 #include "core/hle/service/server_manager.h"
@@ -64,6 +67,10 @@ struct ProcessContext {
         m_nrr_in_use = {};
         m_nro_infos = {};
         m_nrr_infos = {};
+#if defined(_WIN32) && defined(HAS_NCE)
+        m_nro_nce_patches = {};
+        m_nro_nce_kernel = std::addressof(kernel);
+#endif
 
         m_process = process;
         m_process_id = process_id;
@@ -85,6 +92,12 @@ struct ProcessContext {
         m_nrr_in_use = {};
         m_nro_infos = {};
         m_nrr_infos = {};
+#if defined(_WIN32) && defined(HAS_NCE)
+        for (NroNcePatch& patch : m_nro_nce_patches) {
+            ReleaseNroNcePatch(patch, kernel);
+        }
+        m_nro_nce_kernel = nullptr;
+#endif
 
         m_process = nullptr;
         m_process_id = InvalidProcessId;
@@ -278,11 +291,29 @@ struct ProcessContext {
         m_nro_in_use[index] = in_use;
     }
 
+#if defined(_WIN32) && defined(HAS_NCE)
+    NroNcePatch& GetNroNcePatch(const NroInfo* info) {
+        ASSERT(std::addressof(m_nro_infos[0]) <= info &&
+               info <= std::addressof(m_nro_infos[MaxNroInfos - 1]));
+        const size_t index = info - std::addressof(m_nro_infos[0]);
+        return m_nro_nce_patches[index];
+    }
+
+    Kernel::KernelCore& GetNroNceKernel() const {
+        ASSERT(m_nro_nce_kernel != nullptr);
+        return *m_nro_nce_kernel;
+    }
+#endif
+
 private:
     std::array<bool, MaxNroInfos> m_nro_in_use{};
     std::array<bool, MaxNrrInfos> m_nrr_in_use{};
     std::array<NroInfo, MaxNroInfos> m_nro_infos{};
     std::array<NrrInfo, MaxNrrInfos> m_nrr_infos{};
+#if defined(_WIN32) && defined(HAS_NCE)
+    std::array<NroNcePatch, MaxNroInfos> m_nro_nce_patches{};
+    Kernel::KernelCore* m_nro_nce_kernel{};
+#endif
     Kernel::KProcess* m_process{};
     u64 m_process_id{InvalidProcessId};
     bool m_in_use{};
@@ -422,9 +453,22 @@ public:
                                    std::addressof(ro_size), std::addressof(rw_size),
                                    nro_info->base_address, nro_size, bss_size));
 
+#if defined(_WIN32) && defined(HAS_NCE)
+        NroNcePatch& nce_patch = context->GetNroNcePatch(nro_info);
+        (void)ApplyNroNcePatch(nce_patch, context->GetNroNceKernel(), context->GetProcess(),
+                               nro_info->base_address, nro_size, bss_size, rx_size,
+                               nro_info->module_id.data);
+#endif
+
         // Set NRO perms.
-        R_TRY(SetNroPerms(context->GetProcess(), nro_info->base_address, rx_size, ro_size,
-                          rw_size + bss_size));
+        const Result perms_result = SetNroPerms(context->GetProcess(), nro_info->base_address,
+                                                rx_size, ro_size, rw_size + bss_size);
+#if defined(_WIN32) && defined(HAS_NCE)
+        if (R_FAILED(perms_result)) {
+            RemoveNroNcePatch(nce_patch, context->GetNroNceKernel(), context->GetProcess());
+        }
+#endif
+        R_TRY(perms_result);
 
         context->SetNroInfoInUse(nro_info, true);
         nro_info->code_size = rx_size + ro_size;
@@ -445,6 +489,11 @@ public:
         // Check the NRO is loaded.
         NroInfo* nro_info = nullptr;
         R_TRY(context->GetNroInfoByAddress(std::addressof(nro_info), nro_address));
+
+#if defined(_WIN32) && defined(HAS_NCE)
+        RemoveNroNcePatch(context->GetNroNcePatch(nro_info), context->GetNroNceKernel(),
+                          context->GetProcess());
+#endif
 
         // Unmap.
         const NroInfo nro_backup = *nro_info;

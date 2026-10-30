@@ -547,6 +547,50 @@ bool ReadRecoveryBytes(std::uintptr_t source, void* destination, std::size_t siz
            read == size;
 }
 
+#if SNAPRYU_DIAGNOSTICS
+// S3z5 diagnostic switch. EDEN_NCE_RECOVER_OFF turns patch-window recovery off per recipe kind,
+// or per step of a kind. A switched-off capture is resumed unchanged and retried, which is what
+// every kind did before it had a recipe (B2x1 behaviour for mrs/cond, pre-B2 for all).
+// Tokens, separated by ',': subst, bitfield, mrs, cond, all; "kind:N" switches off step N only.
+// Example: EDEN_NCE_RECOVER_OFF=mrs,cond:7
+constexpr std::size_t RecoveryKindCount = 4;
+using RecoveryOffMasks = std::array<u32, RecoveryKindCount>;
+
+[[nodiscard]] RecoveryOffMasks ParseRecoveryOff(const char* value) noexcept {
+    RecoveryOffMasks masks{};
+    if (value == nullptr) {
+        return masks;
+    }
+    constexpr std::array<const char*, RecoveryKindCount> names{"subst", "bitfield", "mrs", "cond"};
+    const std::string text{value};
+    std::size_t begin = 0;
+    while (begin <= text.size()) {
+        const std::size_t end = std::min(text.find(',', begin), text.size());
+        const std::string token = text.substr(begin, end - begin);
+        const std::size_t colon = token.find(':');
+        const std::string name = token.substr(0, colon);
+        u32 bits = ~0U;
+        if (colon != std::string::npos) {
+            const unsigned long step = std::strtoul(token.c_str() + colon + 1, nullptr, 10);
+            bits = step < 32 ? (1U << step) : 0U;
+        }
+        for (std::size_t kind = 0; kind < RecoveryKindCount; ++kind) {
+            if (name == "all" || name == names[kind]) {
+                masks[kind] |= bits;
+            }
+        }
+        begin = end + 1;
+    }
+    return masks;
+}
+
+// Read once by ArmNce::Initialize on the emulator thread, before any break worker can capture.
+[[nodiscard]] const RecoveryOffMasks& RecoveryOff() noexcept {
+    static const RecoveryOffMasks masks = ParseRecoveryOff(std::getenv("EDEN_NCE_RECOVER_OFF"));
+    return masks;
+}
+#endif
+
 // R2b-B2. The target stopped inside a generated x18 substitution helper. Rebuild the guest
 // architectural state at that instruction boundary from the recipe the patcher recorded, so the
 // break is delivered now instead of being retried until the helper branches back to guest code.
@@ -564,6 +608,15 @@ bool TryRecoverX18Substitution(BreakTransformState& state, ARM64_NT_CONTEXT& con
         return false;
     }
     const auto* const step = recipe->FindStep(context.Pc);
+#if SNAPRYU_DIAGNOSTICS
+    if (step != nullptr) {
+        const auto kind = static_cast<std::size_t>(recipe->kind);
+        const auto index = static_cast<std::size_t>(step - recipe->steps.data());
+        if (kind < RecoveryKindCount && index < 32 && (RecoveryOff()[kind] >> index & 1U) != 0) {
+            return false;
+        }
+    }
+#endif
     constexpr u32 SpillContext = static_cast<u32>(offsetof(Params, x18_scratch));
     constexpr u32 SpillValue = SpillContext + static_cast<u32>(sizeof(u64));
     constexpr u32 NativeContext = static_cast<u32>(offsetof(Params, native_context));
@@ -1542,6 +1595,15 @@ ArmNce::ArmNce(System& system, bool uses_wall_clock, std::size_t core_index)
 ArmNce::~ArmNce() = default;
 
 void ArmNce::Initialize() {
+#if SNAPRYU_DIAGNOSTICS
+    static std::once_flag recover_off_once;
+    std::call_once(recover_off_once, [] {
+        const auto& off = RecoveryOff();
+        LOG_WARNING(Render_Vulkan,
+                    "NCE_RECOVER_OFF subst={:#x} bitfield={:#x} mrs={:#x} cond={:#x}",
+                    off[0], off[1], off[2], off[3]);
+    });
+#endif
     if (!NCE::WindowsNceTransition::Initialize()) {
         LOG_CRITICAL(Core_ARM, "Failed to resolve Windows NCE NtContinue transition");
     }
@@ -1682,7 +1744,6 @@ HaltReason ArmNce::RunThread(Kernel::KThread* thread) {
     (void)NCE::WriteStep::GetMode();
 #endif
 
-    const auto& post_handlers = process->GetPostHandlers();
     std::optional<Common::HostMemory::PrivateMappingLease> private_stack_lease;
     const char* abort_site = "native-exit";
     u64 last_native_exit = 0;
@@ -1755,7 +1816,8 @@ HaltReason ArmNce::RunThread(Kernel::KThread* thread) {
         const DWORD stats_entry_os_thread = GetCurrentThreadId();
         const u64 stats_entry_host_sp = m_guest_ctx.host_ctx.host_sp;
         SNAPRYU_R2A(NCE::R2a::StorePhase(m_r2a_phase, NCE::R2a::Phase::Transition);)
-        if (const auto it = post_handlers.find(m_guest_ctx.pc); it != post_handlers.end()) {
+        const auto& entry_handlers = process->GetPostHandlers();
+        if (const auto it = entry_handlers.find(m_guest_ctx.pc); it != entry_handlers.end()) {
             hr = static_cast<HaltReason>(NCE::WindowsNceEnterGuest(
                 &m_guest_ctx, reinterpret_cast<const void*>(it->second)));
         } else {
@@ -1807,7 +1869,7 @@ HaltReason ArmNce::RunThread(Kernel::KThread* thread) {
             } else if (raw_hr == NCE::WindowsX18FallbackTrap::ReturnMarker) {
                 NCE::Stats::Add(NCE::Stats::ExitX18Fallback);
                 if (const auto original = NCE::WindowsX18FallbackTrap::FindOriginalInstruction(
-                        m_guest_ctx.pc, post_handlers)) {
+                        m_guest_ctx.pc, process->GetPostHandlers())) {
                     NCE::Stats::RecordTrapSite(m_guest_ctx.pc, *original);
                 }
             } else if (True(hr & HaltReason::SupervisorCall)) {
@@ -2078,7 +2140,8 @@ HaltReason ArmNce::RunThread(Kernel::KThread* thread) {
 
         const bool needs_private_stack_sync =
             private_stack_lease.has_value() && !fallback_uses_private_stack_view &&
-            P2CNeedsPrivateStackSync(static_cast<u64>(hr), process, m_guest_ctx, post_handlers);
+            P2CNeedsPrivateStackSync(static_cast<u64>(hr), process, m_guest_ctx,
+                                     process->GetPostHandlers());
 
         if (needs_private_stack_sync && !private_stack_lease->SyncToBacking()) {
             LOG_ERROR(Core_ARM, "V16 failed to synchronize private NCE stack to backing");
@@ -2096,7 +2159,8 @@ HaltReason ArmNce::RunThread(Kernel::KThread* thread) {
         const u64 stats_fallback_t0 = NCE::Stats::Now();
         SNAPRYU_R2A(NCE::R2a::StorePhase(m_r2a_phase, NCE::R2a::Phase::Fallback);)
         const auto fallback = m_windows_x18_runner->Dispatch(
-            static_cast<u64>(hr), thread, m_guest_ctx, post_handlers, private_stack_base,
+            static_cast<u64>(hr), thread, m_guest_ctx, process->GetPostHandlers(),
+            private_stack_base,
             private_stack_size);
         SNAPRYU_R2A(NCE::R2a::StorePhase(m_r2a_phase, NCE::R2a::Phase::HostReturn);)
         if (static_cast<u64>(hr) == NCE::WindowsX18FallbackTrap::ReturnMarker) {
